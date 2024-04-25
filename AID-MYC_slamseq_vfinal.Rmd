@@ -1,0 +1,637 @@
+---
+title: "AID-MYC KO SLAM-seq"
+author: "Ines Rivero Garcia"
+date: "01/02/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/NetVolumes/LAB_MT/RESULTADOS/Ines/mycKO_SLAMseq_test/")
+```
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(RColorBrewer)
+library(kableExtra)
+library(DESeq2)
+library(biomaRt)
+library(ComplexHeatmap)
+library(ggrepel)
+library(VennDiagram)
+library(apeglm)
+library(AnnotationDbi)
+library(fgsea)
+library(stringr)
+library(gridExtra)
+library(OmnipathR)
+```
+```{r load_data, include=FALSE}
+DMSO1 <- read.csv("data/AID-MYC_DMSO1.tsv", header = TRUE, sep="\t")
+DMSO2 <- read.csv("data/AID-MYC_DMSO2.tsv", header = TRUE, sep="\t")
+DMSO3 <- read.csv("data/AID-MYC_DMSO3.tsv", header = TRUE, sep="\t")
+IAA1 <- read.csv("data/AID-MYC_IAA1.tsv", header = TRUE, sep="\t")
+IAA2 <- read.csv("data/AID-MYC_IAA2.tsv", header = TRUE, sep="\t")
+IAA3 <- read.csv("data/AID-MYC_IAA3.tsv", header = TRUE, sep="\t")
+metadata <- read.csv("data/metadata.csv", row.names = 1, header = TRUE)
+metadata$Treatment <- as.factor(metadata$Treatment)
+```
+# Experimental design
+The data comes from Muhar *et al.*. In this experiment, the MYC-overexpressing human leukemia cell line K526 is used to identify the direct transcriptional targets of MYC in leukemia using SLAM-seq. For this, the endogenous MYC locus of K526 cells is tagged with the auxin inducible degron (AID), which allows for rapid degradation of MYC after treatment with the chemical IAA in Tir1 +/+ cells. 
+
+
+In this analysis we aim to find the differences between using the total reads (analogous to a bulk RNA-seq experiment) or using the labeled reads (a proper SLAM-seq experiment) for the identification of genes directly regulated by MYC in a leukemia context. Therefore, we perform two analyses which results will be compared:
+
+
+1. Differential expression analysis and GSEA of MYC-KO vs. Control using total reads.
+
+
+2. Differential expression analysis and GSEA of MYC-KO vs. Control using labeled reads.
+
+
+The samples are summarized in Table 1:
+```{r data_table, echo=FALSE}
+as.data.frame(cbind(rownames(metadata), as.character(metadata$Treatment), 
+                    c(rep("WT", 3), rep("MYC-KO", 3))))%>%
+  kbl(col.names = c("Sample", "Treatment", "Genotype"), caption = "Table 1: Sample information") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+# Preprocesing with slamdunk
+## Slamdunk
+Gene and 3' UTR annotations were obtained from the UCSC table browser (https://genome.ucsc.edu/cgi-bin/hgTables, June 2016). 3’ UTR annotations were assigned to Entrez GeneIDs and collapsed on a per-gene basis using bedtools’ merge command (38). For genes lacking an annotated 3' UTR, Ensembl v84 3' UTRs were added if available, resulting in a total of 58136 annotated 3' UTR intervals for 25420 genes. 
+
+
+Adapters were trimmed from raw reads using cutadapt through the trim_galore (v0.3.7) wrapper tool with adapter overlaps set to 3bp for trimming. 
+
+
+Trimmed reads were further processed using SlamDunk v0.2.4 (http://github.com/t-neumann/slamdunk), running the full analysis procedure (slamdunk all) and aligning against the human genome (GRCh38), trimming 12bp from the 5’ end, reporting up to 100 alignments for multi-mappers and activating the multi-mapper retention strategy, filtering for variants with a variant fraction of 0.2 and filtering for base-quality cutoff of ≥27. Unless indicated otherwise, reads were filtered for having ≥2 T>C conversions. Remaining parameters were left to their defaults.
+
+
+## Construction of count matrix
+Two count matrices are built:
+
+
+1. Labeled reads: contains the T>C reads for all samples.
+
+
+2. Total reads: contains the total reads for all samples.
+```{r addEnsemblIDs, include=FALSE}
+EntrezIDs <- unique(c(as.character(DMSO1$Name), as.character(DMSO2$Name), as.character(DMSO3$Name),
+                      as.character(IAA1$Name), as.character(IAA2$Name), as.character(IAA3$Name)))
+mart <-useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = "http://www.ensembl.org")
+EnsemblIDs<- getBM(attributes= c("entrezgene_id", "ensembl_gene_id", "hgnc_symbol", "hgnc_id"),
+                   filters = "entrezgene_id", 
+                   values = EntrezIDs, mart = mart)
+
+# Keep one row per EntrezID
+EnsemblIDs = EnsemblIDs[order(EnsemblIDs[,'entrezgene_id'],EnsemblIDs[,'hgnc_symbol']),]
+EnsemblIDs = EnsemblIDs[!duplicated(EnsemblIDs$entrezgene_id),]
+```
+```{r create_count_matrices, include=FALSE}
+# Add rows that refer to the same gene
+sample.names <- c("DMSO1", "DMSO2", "DMSO3", "IAA1", "IAA2", "IAA3")
+counts.labeled <- as.data.frame(matrix(0, nrow = length(EntrezIDs), ncol = length(sample.names)))
+rownames(counts.labeled) <- EntrezIDs
+colnames(counts.labeled) <- sample.names
+
+
+counts.total <- as.data.frame(matrix(0, nrow = length(EntrezIDs), ncol = length(sample.names)))
+rownames(counts.total) <- EntrezIDs
+colnames(counts.total) <- sample.names
+
+# DMSO1
+for(i in 1:nrow(DMSO1)){
+  n <- DMSO1[i, 13] #TcReadCounts
+  m <- DMSO1[i, 12] #TotalCounts
+  g <- as.character(DMSO1[i, "Name"])
+  counts.labeled[g, 1] <- counts.labeled[g, 1]+n
+  counts.total[g, 1] <- counts.total[g, 1]+m
+}
+
+# DMSO2
+for(i in 1:nrow(DMSO2)){
+  n <- DMSO2[i, 13] #TcReadCounts
+  m <- DMSO2[i, 12] #TotalCounts
+  g <- as.character(DMSO2[i, "Name"])
+  counts.labeled[g, 2] <- counts.labeled[g, 2]+n
+  counts.total[g, 2] <- counts.total[g, 2]+m
+}
+
+# DMSO3
+for(i in 1:nrow(DMSO3)){
+  n <- DMSO3[i, 13] #TcReadCounts
+  m <- DMSO3[i, 12] #TotalCounts
+  g <- as.character(DMSO3[i, "Name"])
+  counts.labeled[g, 3] <- counts.labeled[g, 3]+n
+  counts.total[g, 3] <- counts.total[g, 3]+m
+}
+
+# IAA1
+for(i in 1:nrow(IAA1)){
+  n <- IAA1[i, 13] #TcReadCounts
+  m <- IAA1[i, 12] #TotalCounts
+  g <- as.character(IAA1[i, "Name"])
+  counts.labeled[g, 4] <- counts.labeled[g, 4]+n
+  counts.total[g, 4] <- counts.total[g, 4]+m
+}
+
+# IAA2
+for(i in 1:nrow(IAA2)){
+  n <- IAA2[i, 13] #TcReadCounts
+  m <- IAA2[i, 12] #TotalCounts
+  g <- as.character(IAA2[i, "Name"])
+  counts.labeled[g, 5] <- counts.labeled[g, 5]+n
+  counts.total[g, 5] <- counts.total[g, 5]+m
+}
+
+# IAA3
+for(i in 1:nrow(IAA3)){
+  n <- IAA3[i, 13] #TcReadCounts
+  m <- IAA3[i, 12] #TotalCounts
+  g <- as.character(IAA3[i, "Name"])
+  counts.labeled[g, 6] <- counts.labeled[g, 6]+n
+  counts.total[g, 6] <- counts.total[g, 6]+m
+}
+```
+## Pre-filtering
+Muhar *et al.* performed differential gene expression calling on raw read counts with ≥ 2 T>C conversions. Therefore, we will keep those genes that have ≥ 2 T>C in the labeled count matrix and in the total counts matrix.
+```{r startdeseq, include=FALSE}
+# Check that sample names are the same in colData and in counts matrix
+all(rownames(metadata) == colnames(counts.labeled))
+all(rownames(metadata) == colnames(counts.total))
+
+# Pre-filtering: remove genes with < 2 T>C in < 2 samples
+keep <- rowSums(counts.labeled) >= 2
+counts.labeled <- counts.labeled[keep, ]
+keep <- rownames(counts.labeled)
+counts.total <- counts.total[keep, ]
+
+dds.labeled <- DESeqDataSetFromMatrix(countData =as.matrix(counts.labeled),
+                              colData = metadata, design = ~ Treatment)
+dds.total <- DESeqDataSetFromMatrix(countData = as.matrix(counts.total), 
+                              colData = metadata, design = ~ Treatment)
+```
+```{r releveling_factors, include=FALSE}
+dds.labeled$Treatment <- relevel(dds.labeled$Treatment, ref = "DMSO")
+dds.total$Treatment <- relevel(dds.total$Treatment, ref = "DMSO")
+```
+```{r gene_table, echo=FALSE}
+gene.table <- as.data.frame(cbind(c("Original number of genes", "Number of genes after filtering"), c(length(unique(DMSO1$Name)), nrow(dds.labeled))))
+gene.table %>%
+  kbl(col.names = NULL, caption = "Table 2: Number of genes before and after pre-filtering.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Exploratory analysis of samples
+## Sample clustering
+```{r variancestabilizingtransf, include=FALSE}
+vsd.labeled<- vst(dds.labeled, blind = FALSE)
+vsd.total <- vst(dds.total, blind = FALSE)
+```
+```{r sample_distances, include=FALSE,}
+dist.labeled <- dist(t(assay(vsd.labeled)))
+dist.total <- dist(t(assay(vsd.total)))
+```
+```{r labeled_sample_heatmap, echo=FALSE}
+dist.labeled.m <- as.matrix(dist.labeled)
+#colnames(dist.labeled.m) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(6, "Reds")) )(255)
+pheatmap(dist.labeled.m,
+         clustering_distance_rows = dist.labeled,
+         clustering_distance_cols = dist.labeled,
+         col = colors, 
+         main="Sample clustering with labeled reads",
+         display_numbers = TRUE, number_color = "black",
+         fontsize_number = 12, treeheight_col = 0,
+         labels_row=c("Control 1", "Control 2", "Control 3", "MYC-KO 1", "MYC-KO 2", "MYC-KO 3"),
+         filename = )
+
+#svg("results/heatmap_labeled.svg", height = 4, width = 7)
+Heatmap(dist.labeled.m, 
+        col = colors, 
+        border = TRUE, name = "Euclidean distance",
+        column_labels = c("Control 1", "Control 2", "Control 3", "Myc KO 1", "Myc KO 2", "Myc KO 3"), 
+        row_labels = c("Control 1", "Control 2", "Control 3", "Myc KO 1", "Myc KO 2", "Myc KO 3"), 
+        row_names_side = "left",
+        column_names_rot = 0, 
+        column_names_centered = TRUE,
+        rect_gp = gpar(col = "black", lwd = 0.5),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sprintf("%.2f", dist.labeled.m[i, j]), x, y, gp = gpar(fontsize = 10))}
+)
+#dev.off()
+```
+```{r total_sample_heatmap, echo=FALSE}
+dist.total.m <- as.matrix(dist.total)
+colors <- colorRampPalette( rev(brewer.pal(6, "Greys")) )(255)
+pheatmap(dist.total.m,
+         clustering_distance_rows = dist.total,
+         clustering_distance_cols = dist.total,
+         col = colors,
+         main="Sample clustering with total reads \n (blinded vst)", 
+         display_numbers = TRUE, number_color = "black", 
+         fontsize_number = 12, treeheight_col = 0,
+         labels_row=c("Control 1", "Control 2", "Control 3", "MYC-KO 1", "MYC-KO 2", "MYC-KO 3")) 
+
+#svg("results/heatmap_total.svg", height = 4, width = 7)
+Heatmap(dist.total.m, 
+        col = colors, 
+        border = TRUE, name = "Euclidean distance",
+        column_labels = c("Control 1", "Control 2", "Control 3", "Myc KO 1", "Myc KO 2", "Myc KO 3"), 
+        row_labels = c("Control 1", "Control 2", "Control 3", "Myc KO 1", "Myc KO 2", "Myc KO 3"), 
+        row_names_side = "left",
+        column_names_rot = 0, 
+        column_names_centered = TRUE,
+        rect_gp = gpar(col = "black", lwd = 0.5),
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {grid.text(sprintf("%.2f", dist.labeled.m[i, j]), x, y, gp = gpar(fontsize = 10))}
+)
+#dev.off()
+```
+```{r compare_euc_dist, echo=FALSE}
+# Transform into a nice data frame for plotting.
+dist.labeled.df <- as.data.frame(dist.labeled.m)
+dist.labeled.df$variable2 <- rownames(dist.labeled.df)
+dist.labeled.df <- reshape2::melt(dist.labeled.df)
+
+dist.total.df <- as.data.frame(dist.total.m)
+dist.total.df$variable2 <- rownames(dist.total.df)
+dist.total.df <- reshape2::melt(dist.total.df)
+
+# Remove distance between the same sample
+rownames(dist.labeled.df) <- 1:nrow(dist.labeled.df)
+keep <- rownames(dist.labeled.df[dist.labeled.df$variable != dist.labeled.df$variable2,])
+dist.labeled.df <- dist.labeled.df[keep,]
+
+rownames(dist.total.df) <- 1:nrow(dist.total.df)
+keep <- rownames(dist.total.df[dist.total.df$variable != dist.total.df$variable2,])
+dist.total.df <- dist.total.df[keep,]
+
+# Annotate the distances as intra grouo DMSO, intrgroup IAA or intergroup
+dist.labeled.df$Comparison <- NA
+dist.total.df$Comparison <- NA
+
+for(i in 1:nrow(dist.labeled.df)){
+  if(dist.labeled.df[i, "variable"] %in% c("DMSO1", "DMSO2", "DMSO3")) {
+    if(dist.labeled.df[i, "variable2"] %in% c("DMSO1", "DMSO2", "DMSO3")){
+      dist.labeled.df[i, "Comparison"] <- "Within Control"
+    }else{
+      dist.labeled.df[i, "Comparison"] <- "Control vs. Myc KO"
+    }
+  }
+  
+  if(dist.labeled.df[i, "variable"] %in% c("IAA1", "IAA2", "IAA3")) {
+    if(dist.labeled.df[i, "variable2"] %in% c("IAA1", "IAA2", "IAA3")){
+      dist.labeled.df[i, "Comparison"] <- "Within Myc KO"
+    }else{
+      dist.labeled.df[i, "Comparison"] <- "Control vs. Myc KO"
+    }
+  }
+}
+
+for(i in 1:nrow(dist.total.df)){
+  if(dist.total.df[i, "variable"] %in% c("DMSO1", "DMSO2", "DMSO3")) {
+    if(dist.total.df[i, "variable2"] %in% c("DMSO1", "DMSO2", "DMSO3")){
+      dist.total.df[i, "Comparison"] <- "Within Control"
+    }else{
+      dist.total.df[i, "Comparison"] <- "Control vs. Myc KO"
+    }
+  }
+  
+  if(dist.total.df[i, "variable"] %in% c("IAA1", "IAA2", "IAA3")) {
+    if(dist.total.df[i, "variable2"] %in% c("IAA1", "IAA2", "IAA3")){
+      dist.total.df[i, "Comparison"] <- "Within Myc KO"
+    }else{
+      dist.total.df[i, "Comparison"] <- "Control vs. Myc KO"
+    }
+  }
+}
+
+# Add info on experiment
+dist.labeled.df$Experiment <- "SLAM-seq"
+dist.total.df$Experiment <- "RNA-seq"
+dist.df <- rbind(dist.total.df, dist.labeled.df)
+
+# Remove duplicated rows: each distance is measured twice: distance(a,b) and distance(b,a)
+keep <- c()
+for(i in 1:nrow(dist.df)){
+  if(dist.df[i, "variable",] == "DMSO1"){keep <- c(keep, TRUE)}
+  if(dist.df[i, "variable"] == "DMSO2"){
+    if(is.element(dist.df[i, "variable2"], c("DMSO3", "IAA1", "IAA2", "IAA3"))){
+      keep <- c(keep, TRUE)
+    }else{
+      keep <- c(keep, FALSE)
+    }
+  }
+  if(dist.df[i, "variable"] == "DMSO3"){
+    if(is.element(dist.df[i, "variable2"], c("IAA1", "IAA2", "IAA3"))){
+      keep <- c(keep, TRUE)
+    }else{
+      keep <- c(keep, FALSE)
+    }
+  }
+  if(dist.df[i, "variable"] == "IAA1"){
+    if(is.element(dist.df[i, "variable2"], c("IAA2", "IAA3"))){
+      keep <- c(keep, TRUE)
+    }else{
+      keep <- c(keep, FALSE)
+    }
+  }
+  if(dist.df[i, "variable"] == "IAA2"){
+    if(is.element(dist.df[i, "variable2"], c("IAA3"))){
+      keep <- c(keep, TRUE)
+    }else{
+      keep <- c(keep, FALSE)
+    }
+  }
+  if(dist.df[i, "variable"] == "IAA3"){keep <- c(keep, FALSE)}
+}
+
+dist.df <- dist.df[keep,]
+
+#svg("results/boxplot_compare_distances.svg", height = 4, width = 6)
+ggplot(dist.df, aes(x = Experiment, y = value, fill = Experiment, color = Experiment)) + 
+  geom_boxplot(alpha = 0.3) + 
+  geom_jitter() +
+  facet_wrap(~ Comparison) + 
+  ylim(c(0,15)) +
+  theme_bw() +
+  ylab("Euclidean distance between pairs of samples") +
+  scale_color_manual(values = c("black", "#DA012D")) +
+  scale_fill_manual(values = c("black", "#DA012D")) +
+  theme(legend.position = "none")
+#dev.off()
+
+# Stat test
+wilcox.test(dist.df[dist.df$Comparison == "Control vs. Myc KO" & dist.df$Experiment == "RNA-seq","value"], 
+            dist.df[dist.df$Comparison == "Control vs. Myc KO" & dist.df$Experiment == "SLAM-seq","value"], paired = TRUE)
+wilcox.test(dist.df[dist.df$Comparison == "Within Control" & dist.df$Experiment == "RNA-seq","value"], 
+            dist.df[dist.df$Comparison == "Within Control" & dist.df$Experiment == "SLAM-seq","value"], paired = TRUE)
+wilcox.test(dist.df[dist.df$Comparison == "Within Myc KO" & dist.df$Experiment == "RNA-seq","value"], 
+            dist.df[dist.df$Comparison == "Within Myc KO" & dist.df$Experiment == "SLAM-seq","value"], paired = TRUE)
+p.adjust(c(0.003906, 0.25, 0.25))
+```
+
+## PCA of samples
+```{r labeledPCA, echo=FALSE,  fig.width=6, fig.height=3}
+image <- 
+  plotPCA(vsd.labeled, intgroup = "Treatment", ntop=200)+
+  ggtitle("PCA using SLAM-seq") +  
+  scale_color_manual(name = "Group", values = c("#FF8A8A","#A30000"), labels=c("Control", "MYC-KO")) + 
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 4)) +
+  theme_bw() + 
+  expand_limits(y=c(-2:2)) +
+  theme(plot.title = element_text(face="bold", hjust = 0.5, size = 14), legend.position = "bottom", 
+        axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12, face = "bold"))
+ggsave(filename = "results/pca_labeled-reads.png", plot = image, device = "png", dpi = 300)
+```
+```{r totalPCA, echo=FALSE, fig.width=6, fig.height=3}
+image <- 
+  plotPCA(vsd.total, intgroup = "Treatment", ntop=200)+
+  ggtitle("PCA using RNA-seq") +  
+  scale_color_manual(name = "Group", values = c("grey70","grey20"), labels=c("Control", "MYC-KO")) + 
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 4)) +
+  theme_bw() + 
+  expand_limits(y=c(-2:2), x = c(-8, 8)) +
+  theme(plot.title = element_text(face="bold", hjust = 0.5, size = 14), legend.position = "bottom", 
+        axis.title = element_text(size = 12), axis.text = element_text(size = 10), legend.text = element_text(size = 12),
+        legend.title = element_text(size = 12, face = "bold"))
+ggsave(filename = "results/pca_total-reads.png", plot = image, device = "png", dpi = 300)
+```
+
+
+# Differential gene expression analysis
+MYC-KO vs. WT differential gene expression analysis was performed for both labeled and total counts to compare if SLAM-seq labeled reads find specific perturbations caused by the absence of MYC.
+
+
+Size factors were estimated on corresponding total mRNA reads for global normalization. 
+```{r deseq, include=FALSE, message=FALSE}
+# One-step DESeq
+#dds.labeled <- DESeq(dds.labeled) 
+#dds.total <- DESeq(dds.total)
+
+#res.labeled.onestep <- results(dds.labeled, contrast = c("Treatment", "IAA", "DMSO"), alpha = 0.05)
+#res.total.onestep <- results(dds.total, contrast = c("Treatment", "IAA", "DMSO"), alpha = 0.05)
+
+# 1. Estimate size factors of total mRNA
+dds.total <- estimateSizeFactors(dds.total)
+sf.total <- sizeFactors(dds.total)
+sizeFactors(dds.labeled) <- sf.total 
+# 2. Estimate dispersions
+dds.labeled <- estimateDispersions(dds.labeled)
+dds.total <- estimateDispersions(dds.total)
+# 3. Negative Binomial GLM fitting and Wald statistics
+dds.labeled <- nbinomWaldTest(dds.labeled)
+dds.total <- nbinomWaldTest(dds.total)
+# 4. Get results
+res.labeled <- results(dds.labeled, contrast = c("Treatment", "IAA", "DMSO"), alpha = 0.05)
+res.total <- results(dds.total, contrast = c("Treatment", "IAA", "DMSO"), alpha = 0.05)
+# 5. Shrink LFCs
+res.labeled.SLFC <- lfcShrink(dds.labeled, res=res.labeled, coef="Treatment_IAA_vs_DMSO", type="apeglm")
+res.total.SLFC <- lfcShrink(dds.total, coef="Treatment_IAA_vs_DMSO", type="apeglm")
+# 6. Prepare results for TFEA.ChIP
+#labeled.table <- preprocessInputData(res.labeled.SLFC)
+#total.table <- preprocessInputData(res.total.SLFC)
+```
+## MA plots
+```{r maLabeled, echo=FALSE, message=FALSE}
+plotMA(res.labeled.SLFC, ylim=c(-5,5), main="SLAM-seq: MYC-KO vs Control \n MA", colSig="#ff0038")
+``` 
+```{r maTotal, echo=FALSE, message=FALSE}
+plotMA(res.total.SLFC, ylim=c(-5,5), main="Total reads", colSig = "black")
+```
+```{r annotateresults, include=FALSE}
+res.labeled.SLFC <- as.data.frame(res.labeled.SLFC[order(res.labeled.SLFC$padj),])
+res.total.SLFC <- as.data.frame(res.total.SLFC[order(res.total.SLFC$padj),])
+
+res.labeled.SLFC$Entrez_ID <- rownames(res.labeled.SLFC)
+res.total.SLFC$Entrez_ID <- rownames(res.total.SLFC)
+
+# Add gene symbol and ensembl ID
+res.labeled.SLFC <- merge(x = res.labeled.SLFC, y = EnsemblIDs, by.x = "Entrez_ID", by.y = "entrezgene_id", 
+                          all.x = TRUE)
+res.total.SLFC <- merge(x = res.total.SLFC, y = EnsemblIDs, by.x = "Entrez_ID", by.y = "entrezgene_id", 
+                        all.x = TRUE)
+```
+## Volcano plots
+```{r volcano.labeled, echo=FALSE, warning=FALSE, message=FALSE}
+res.labeled.SLFC <- mutate(res.labeled.SLFC, sig=ifelse(res.labeled.SLFC$padj<0.05, "Sign", "NotSig"))
+res.labeled.SLFC[["sig"]][is.na(res.labeled.SLFC[["sig"]])] <- "NotSig"
+
+res.labeled.SLFC <- res.labeled.SLFC[order(res.labeled.SLFC$padj),]
+
+#svg("results/volcano_labeled.svg", height = 5, width = 5)
+ggplot(res.labeled.SLFC, aes(x = log2FoldChange, y = -log10(pvalue), color = sig))+
+  geom_point(size = 1) +
+  scale_color_manual(values = c("grey70", "#DA012D")) +
+  geom_text_repel(data=head(res.labeled.SLFC, 10), aes(label=hgnc_symbol), 
+                  max.overlaps = 100, box.padding = 0.75, color ="black") +
+  xlab("Log2(Fold Change)") + 
+  ylab("-Log10(adjusted p-value)") +
+  theme_bw() +
+  theme(legend.position = "none")
+#dev.off()
+```
+```{r volcano.total, echo=FALSE, message=FALSE, warning=FALSE}
+res.total.SLFC <- mutate(res.total.SLFC, sig=ifelse(res.total.SLFC$padj<0.05, "Sign", "NotSig"))
+res.total.SLFC[["sig"]][is.na(res.total.SLFC[["sig"]])] <- "NotSig"
+
+res.total.SLFC <- res.total.SLFC[order(res.total.SLFC$padj),]
+
+#svg("results/volcano_total.svg", height = 5, width = 5)
+ggplot(res.total.SLFC, aes(x = log2FoldChange, y = -log10(pvalue), color = sig))+
+  geom_point(size = 1) +
+  scale_color_manual(values = c("grey70", "black")) +
+  geom_text_repel(data=head(res.total.SLFC, 10), aes(label=hgnc_symbol), 
+                  max.overlaps = 100, box.padding = 0.75, color ="black") +
+  xlab("Log2(Fold Change)") + 
+  ylab("-Log10(adjusted p-value)") +
+  theme_bw() +
+  theme(legend.position = "none")
+#dev.off()
+```
+```{r saveFile, include=FALSE, eval=FALSE}
+write.table(res.labeled.SLFC, "results/MYC-KO_SLAMseq_test_DEGs_Labeled.tsv", col.names = TRUE, row.names =
+              FALSE, quote = FALSE, sep = "\t")
+write.table(res.total.SLFC, "results/MYC-KO_SLAMseq_test_DEGs_Total
+            .tsv", col.names = TRUE, row.names =
+              FALSE, quote = FALSE, sep = "\t")
+```
+
+
+# Analysis with collectri
+```{r load.collectri, echo=FALSE}
+db <- collectri()
+db.list <- vector(mode = "list", length = length(unique(db$source_genesymbol)))
+names(db.list) <- unique(db$source_genesymbol)
+db <- as.data.frame(db)
+
+# Get list: each element are the target gene for a TF/Complex.
+for(i in 1:length(db.list)){db.list[[i]] <- db[db$source_genesymbol == names(db.list)[i], "target_genesymbol"]}
+
+# Prepare ranks
+ranks.labeled <- res.labeled.SLFC$log2FoldChange
+names(ranks.labeled) <- res.labeled.SLFC$hgnc_symbol
+ranks.labeled <- sort(ranks.labeled)
+
+ranks.total <- res.total.SLFC$log2FoldChange
+names(ranks.total) <- res.total.SLFC$hgnc_symbol
+ranks.total <- sort(ranks.total)
+
+# Run gsea
+collectri.labeled.fgsea <- fgsea(ranks.labeled, pathways = db.list)
+collectri.total.fgsea <- fgsea(ranks.total, pathways = db.list)
+
+# Find significant TFs and filter those for plotting
+collectri.labeled.fgsea.significantTF <- collectri.labeled.fgsea %>% filter(padj < 0.05) %>% pull(pathway)
+collectri.total.fgsea.significantTF <- collectri.total.fgsea %>% filter(padj < 0.05) %>% pull(pathway)
+significantTF <- unique(c(collectri.labeled.fgsea.significantTF, collectri.total.fgsea.significantTF))
+
+collectri.labeled.fgsea.significant <- collectri.labeled.fgsea %>% filter(pathway %in% significantTF)
+collectri.labeled.fgsea.significant <- as.data.frame(collectri.labeled.fgsea.significant)
+collectri.labeled.fgsea.significant <- collectri.labeled.fgsea.significant[, c("pathway", "pval", "padj", "NES", "size")]
+
+collectri.total.fgsea.significant <- collectri.total.fgsea %>% filter(pathway %in% significantTF) 
+collectri.total.fgsea.significant <- as.data.frame(collectri.total.fgsea.significant)
+collectri.total.fgsea.significant <- collectri.total.fgsea.significant[, c("pathway", "pval", "padj", "NES", "size")]
+
+collectri.labeled.fgsea.significant$Experiment <- "SLAM-seq"
+collectri.total.fgsea.significant$Experiment <- "RNA-seq"
+
+collectri.df <- rbind(collectri.labeled.fgsea.significant, collectri.total.fgsea.significant)
+
+pdf("results/barplot_regulators_collectri.pdf", height = 4, width = 6)
+ggplot(collectri.df, aes(x = pathway, y = NES, fill = NES, label = round(padj,3))) + 
+  geom_bar(position="dodge", stat="identity", color = "black", lwd = 0.25, width = 0.5) + 
+  facet_wrap(~ Experiment) +
+  scale_fill_distiller(palette = "RdBu", limits = c(-2.2,2.2)) + 
+  theme_bw() +
+  coord_flip()
+dev.off()
+
+collectri.df  
+```
+
+
+# Distribution of known targets in collectri
+```{r known.targets.myc, echo=FALSE}
+collectri.myc <- db %>% filter(source_genesymbol == "MYC")
+collectri.myc <- collectri.myc[, c("target_genesymbol", "is_stimulation")]
+collectri.myc <- merge(collectri.myc, res.labeled.SLFC[, c("log2FoldChange", "padj", "hgnc_symbol")], all.x  = TRUE, by.x = "target_genesymbol", by.y = "hgnc_symbol")
+collectri.myc <- merge(collectri.myc, res.total.SLFC[, c("log2FoldChange", "padj", "hgnc_symbol")], all.x  = TRUE, by.x = "target_genesymbol", by.y = "hgnc_symbol")
+colnames(collectri.myc) <- c("target_genesymbol", "is_stimulation", "log2FoldChange.labeled", "padj.labeled", "log2FoldChange.total", "padj.total")
+
+collectri.myc <- collectri.myc[complete.cases(collectri.myc),]
+labeled.model <- glm(is_stimulation ~ log2FoldChange.labeled, family=binomial(link='logit'), data=collectri.myc)
+total.model <- glm(is_stimulation ~ log2FoldChange.total, family = binomial(link = "logit"), data = collectri.myc)
+
+summary(labeled.model)
+summary(total.model)
+
+# Plot barplot separando known targets por Up.S, Up.NS, Down.S y Down.NS para total y labeled.
+collectri.myc$Class.labeled <- NA
+for(i in 1:nrow(collectri.myc)){
+  if(collectri.myc[i, "log2FoldChange.labeled"] > 0){
+    if(collectri.myc[i, "padj.labeled"] < 0.05){
+      collectri.myc[i, "Class.labeled"] <- "UP.Sig"
+    }else{
+      collectri.myc[i, "Class.labeled"] <- "UP.NotSig"
+    }
+  }
+  if(collectri.myc[i, "log2FoldChange.labeled"] < 0){
+    if(collectri.myc[i, "padj.labeled"] < 0.05){
+      collectri.myc[i, "Class.labeled"] <- "DOWN.Sig"
+    }else{
+      collectri.myc[i, "Class.labeled"] <- "DOWN.NotSig"
+    }
+  }
+}
+
+collectri.myc$Class.total <- NA
+for(i in 1:nrow(collectri.myc)){
+  if(collectri.myc[i, "log2FoldChange.total"] > 0){
+    if(collectri.myc[i, "padj.total"] < 0.05){
+      collectri.myc[i, "Class.total"] <- "UP.Sig"
+    }else{
+      collectri.myc[i, "Class.total"] <- "UP.NotSig"
+    }
+  }
+  if(collectri.myc[i, "log2FoldChange.total"] < 0){
+    if(collectri.myc[i, "padj.total"] < 0.05){
+      collectri.myc[i, "Class.total"] <- "DOWN.Sig"
+    }else{
+      collectri.myc[i, "Class.total"] <- "DOWN.NotSig"
+    }
+  }
+}
+
+class.labeled <- as.data.frame(table(collectri.myc$Class.labeled))
+class.total <- as.data.frame(table(collectri.myc$Class.total))
+
+class.labeled$Experiment <- "SLAM-seq"
+class.total$Experiment <- "RNA-seq"
+
+class.df <- rbind(class.labeled, class.total)
+
+#pdf("results/barplot_collectri_targetsmyc.pdf", height = 4, width = 6)
+ggplot(class.df, aes(x = Experiment, y = Freq, fill = Var1, group = Experiment)) + 
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  ylab("Number of Myc target genes") +
+  scale_y_continuous(limits = c(0, 600), breaks = c(0, 100, 200, 300, 400, 500, 600)) +
+  scale_fill_manual(values = c("lightblue", "cornflowerblue", "lightgoldenrod", "darkgoldenrod"),
+                    labels = c("log2FC < 0 & padj > 0.05", "log2FC < 0 6 padj < 0.05", "log2FC > 0 & padj > 0.05", "log2FC > 0 & padj < 0.05"),
+                    name = "Legend")
+#dev.off()
+```
