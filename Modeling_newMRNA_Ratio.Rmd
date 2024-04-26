@@ -1,0 +1,50 @@
+---
+title: "New mRNA prediction modeling"
+author: "Ines Rivero Garcia"
+date: "7/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/NetVolumes/LAB_MT/RESULTADOS/Ines/Reanima/SLAMseq_CM_test/")
+```
+```{r setup2, include=FALSE}
+library(ggplot2)
+df <- read.csv("GRAND.SLAM/2022-06-06_SlamseqTest.tsv", header = TRUE, sep = "\t")
+df <- df[, c("Gene", "Control.MAP", "X6hours.MAP", "X12hours.MAP", "X24hours.MAP")]
+df <- reshape2::melt(df, id = "Gene")
+```
+# Distribution of median new-to-old ratio per gene
+```{r ntr, echo=FALSE, warning=FALSE, message=FALSE}
+br <- c(-0.05,0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,
+        0.8,0.85,0.9,0.95,1,1.05)
+ggplot(df, aes(x=value, fill=variable)) +
+  geom_histogram(aes(y=..count../sum(..count..)), breaks = br, alpha = 0.5) +
+  #geom_density(aes(y=..scaled..), alpha= 0.1)+
+  facet_grid(~ variable)+
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("grey50", "#fa8072", "#ff0800", "#420d09"))+
+  ylab("Frequency") +xlab("Median new-to-old ratio")
+```
+
+
+# Modeling the total newly synthesized RNA as a function of 4-thiouridine exposure time.
+```{r model,echo=FALSE, warning=FALSE}
+data <- data.frame(Time = c(0,6,12,24),
+                   Proportion = c(0.00090978, 0.51251, 0.62472, 0.74450))
+fm <- nls(Proportion ~ SSasymp(Time, Asym, R0, lrc), data = data)
+summary(fm)
+pdf("AsymptoticModel_PropNewmRNA_s4Upulse.pdf", height = 4, width = 5)
+ggplot(data=data, aes(x=Time, y=Proportion)) +
+  geom_point() +
+  geom_smooth(color="#cd5c5c",se=F, size = 0.3) +
+  geom_smooth(method="nls", formula=y~SSasymp(x, Asym, R0, lrc), color="#c21807", se=F, fullrange=T) +
+  geom_hline(color="grey50", yintercept=0.737518, linetype = "dotted") +
+  scale_x_continuous(limits=c(0,25)) +
+  scale_y_continuous(limits= c(0,1), breaks = c(0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1))+
+  xlab("4-thiouridine pulse length (hours)") + ylab("Proportion of total cellular new mRNA") +
+  theme_classic()
+dev.off()
+```
