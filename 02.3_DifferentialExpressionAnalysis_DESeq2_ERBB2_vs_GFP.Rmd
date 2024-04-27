@@ -1,0 +1,1571 @@
+---
+title: 'SLAM-seq differential expression analysis: ERBB2 vs GFP'
+author: "Inés Rivero-García"
+date: "14/11/2023"
+output: 
+  html_document:
+      theme: cerulean
+      toc: true
+      toc_float: true
+      number_sections: true
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/NetVolumes/LAB_MT/RESULTADOS/Ines/REANIMA_SlamSeq/")
+
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(vsn)
+library(RColorBrewer)
+library(ggrepel)
+library(fgsea)
+library(dplyr)
+library("AnnotationDbi")
+library("org.Mm.eg.db")
+library(ggvenn)
+
+
+# Color palette for samples
+colores <- c("#117733", "#AA3377", "#EE6677", "#DDAA33", "#6699CC", "#332288")
+names(colores) <- c("GFP", "YAP5SA", "MYC", "ERBB2", "MIR199", "MIR590")
+
+# Color palette for inter-sample distance heatmap
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+```
+```{r load_clean_data, echo=FALSE, warning=FALSE, message=FALSE}
+data <- read.delim("GRAND-SLAM/REANIMA_SlamSeq_2023-10-11.tsv")
+
+# Clean data to make it a little smaller and separate between total and labeled counts
+total <- data %>%
+  dplyr::select(Gene, Symbol, Length, 
+           Erbb2_1..Readcount, Erbb2_2..Readcount, Erbb2_3..Readcount, 
+           GFP_2.1..Readcount, GFP_2.2..Readcount, GFP_2.3..Readcount)
+
+labeled <- total
+NTR <- data %>%
+  dplyr::select(Erbb2_1..MAP, Erbb2_2..MAP, Erbb2_3..MAP,
+                GFP_2.1..MAP, GFP_2.2..MAP, GFP_2.3..MAP)
+  
+
+# Labeled counts = raw counts * median new-to-old ratio
+labeled[, 4:ncol(labeled)] <- round(labeled[, 4:ncol(labeled)] * NTR) 
+labeled[is.na(labeled)] <- 0 # Interpret NA's NTR as 0 NTR.
+
+# Create data frame with gene metadata
+geneInfo <- data.frame(Gene = data$Gene,
+                      Symbol = data$Symbol,
+                      Length = data$Length)
+rownames(geneInfo) <- geneInfo$Gene
+
+# Make shorter colnames and add gene ensembl id as rownames
+colnames(total) <- sub("..Readcount", "", colnames(total))
+colnames(labeled) <- sub("..Readcount", "", colnames(labeled))
+
+rownames(total) <- total$Gene
+rownames(labeled) <- labeled$Gene
+
+# Create DF with sample metadata
+coldata <- data.frame(Sample = colnames(total)[4:ncol(total)],
+                      Condition = sub("\\_.*", "", colnames(total)[4:ncol(total)]),
+                      Batch = c(rep(2, 3), rep(2, 3)))
+rownames(coldata) <- coldata$Sample
+coldata$Condition <- as.character(coldata$Condition)
+coldata$Condition[coldata$Condition == "Erbb2"] <- "ERBB2"
+coldata$Condition[coldata$Condition == "GFP"] <- "GFP"
+
+# Check that row and colnames match
+all(rownames(coldata) == colnames(total)[4:ncol(total)])
+all(rownames(coldata) == colnames(total)[4:ncol(labeled)])
+
+# Re-order factor levels
+coldata$Condition <- factor(coldata$Condition,
+                            levels = c("GFP", "ERBB2"))
+
+# Make batch a factor
+coldata$Batch <- factor(coldata$Batch)
+
+coldata
+```
+```{r summarizeMYC, echo=FALSE, eval=FALSE}
+# Sum the counts for Myc and nMyc together: the counts of both will be saved under the ENSEMBL ID of MYC
+total <- total %>%
+  mutate(Gene = ifelse(Gene %in% c("ENSMUSG00000037169", "ENSMUSG00000022346"), "ENSMUSG00000022346", Gene)) %>% # 
+  group_by(Gene) %>%
+  summarise(
+    Erbb2_1 = sum(Erbb2_1),
+    Erbb2_2 = sum(Erbb2_2),
+    Erbb2_3 = sum(Erbb2_3),
+    GFP_2.1 = sum(GFP_2.1),
+    GFP_2.2 = sum(GFP_2.2),
+    GFP_2.3 = sum(GFP_2.3)
+  )
+
+total <- merge(total, data[,c("Gene", "Symbol")], by = "Gene", all.x  = TRUE)
+rownames(total) <- total$Gene
+
+labeled <- labeled %>%
+  mutate(Gene = ifelse(Gene %in% c("ENSMUSG00000037169", "ENSMUSG00000022346"), "ENSMUSG00000022346", Gene)) %>% # 
+  group_by(Gene) %>%
+  summarise(
+    Erbb2_1 = sum(Erbb2_1),
+    Erbb2_2 = sum(Erbb2_2),
+    Erbb2_3 = sum(Erbb2_3),
+    GFP_2.1 = sum(GFP_2.1),
+    GFP_2.2 = sum(GFP_2.2),
+    GFP_2.3 = sum(GFP_2.3)
+  )
+
+labeled <- merge(labeled, data[,c("Gene", "Symbol")], by = "Gene", all.x  = TRUE)
+rownames(labeled) <- labeled$Gene
+
+# I also need to "remove" the geneInfo related to N-MYC
+geneInfo <- geneInfo %>%
+  dplyr::filter(Gene != "ENSMUSG00000037169")
+```
+
+
+# PCA and sample clustering
+```{r prepare_DDSobjects, echo=FALSE, message=FALSE, warning=FALSE}
+total <- total %>%
+  dplyr::select(Erbb2_1, Erbb2_2, Erbb2_3, GFP_2.1, GFP_2.2, GFP_2.3)
+labeled <- labeled %>%
+  dplyr::select(Erbb2_1, Erbb2_2, Erbb2_3, GFP_2.1, GFP_2.2, GFP_2.3)
+
+# Create DESeq objects with all samples.
+dds.total <- DESeqDataSetFromMatrix(countData = round(total),
+                                    colData = coldata,
+                                    design = ~ Condition) 
+dds.labeled <- DESeqDataSetFromMatrix(countData = round(labeled),
+                                      colData = coldata, 
+                                      design = ~ Condition)
+
+# Adding addtional gene info.
+mcols(dds.total) <- DataFrame(mcols(dds.total), geneInfo)
+mcols(dds.labeled) <- DataFrame(mcols(dds.labeled), geneInfo)
+
+# Pre-filtering to speed things up. At least 3 samples with more than 10 counts.
+keep <- rowSums(counts(dds.total) >= 10) >= 3
+dds.total <- dds.total[keep,]
+keep <- rowSums(counts(dds.labeled) >= 10) >= 3
+dds.labeled <- dds.labeled[keep,]
+
+# VST normalization
+vsd.total <- vst(dds.total, blind = FALSE)
+vsd.labeled <- vst(dds.labeled, blind = FALSE)
+
+# Heatmap of sample distances
+sampleDists.vsd.total <- dist(t(assay(vsd.total)))
+sampleDists.vsd.labeled <- dist(t(assay(vsd.labeled)))
+sampleDistMatrix.vsd.total <- as.matrix(sampleDists.vsd.total)
+sampleDistMatrix.vsd.labeled <- as.matrix(sampleDists.vsd.labeled)
+heatmap.total <- pheatmap(sampleDistMatrix.vsd.total, 
+         main = "VST Total counts",
+         clustering_distance_rows = sampleDists.vsd.total, 
+         clustering_distance_cols = sampleDists.vsd.total, 
+         col = colors)
+heatmap.labeled <- pheatmap(sampleDistMatrix.vsd.labeled, 
+         main = "VST Labeled counts",
+         clustering_distance_rows = sampleDists.vsd.labeled, 
+         clustering_distance_cols = sampleDists.vsd.labeled, 
+         col = colors)
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Heatmap_Sample_Distance_Total.svg",
+#    height = 6, width = 6)
+heatmap.total
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Heatmap_Sample_Distance_Labeled.svg",
+#    height = 6, width = 6)
+heatmap.labeled
+#dev.off()
+
+
+# PCA
+pca.total <- plotPCA(vsd.total, intgroup = "Condition", returnData = TRUE)
+pca.labeled <- plotPCA(vsd.labeled, intgroup = "Condition", returnData = TRUE)
+pca.total <- merge(pca.total, coldata, 
+                         by.x = c("Condition", "name"), by.y = c("Condition", "Sample"))
+pca.labeled <- merge(pca.labeled, coldata, 
+                           by.x = c("Condition", "name"), by.y = c("Condition", "Sample"))
+
+pca.total <- ggplot(pca.total, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 3) + 
+  theme_bw() +
+  scale_color_manual(values = colores) +
+  ggtitle("PCA with total reads") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+pca.labeled <- ggplot(pca.labeled, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 3) + 
+  theme_bw() +
+  scale_color_manual(values = colores) +
+  ggtitle("PCA with labeled reads") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_PCA.svg", height = 6, width = 8)
+cowplot::plot_grid(plotlist = list(pca.total, pca.labeled), ncol = 2, nrow = 1)
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_PCA_TotalReads.svg", height = 6, width = 6)
+#pca.total
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_PCA_LabeledReads.svg", height = 6, width = 6)
+#pca.labeled
+#dev.off()
+```
+
+
+# Differential expression analysis
+More genes are DE when we use the total RNA-seq vs the labeled RNA-seq. This is expected because the labeled RNA-seq only considers the RNA-seq synthesized during 4h.
+```{r deseq2, echo=FALSE, message=FALSE, warning=FALSE}
+dds.total <- DESeq(dds.total)
+dds.labeled <- DESeq(dds.labeled)
+res.total <- results(dds.total, contrast = c("Condition", "ERBB2", "GFP"), alpha = 0.1)
+res.labeled <- results(dds.labeled, contrast = c("Condition", "ERBB2", "GFP"), alpha = 0.1)
+summary(res.total)
+summary(res.labeled)
+
+# Log2FC shrinkage for plotting and ranking
+resLFC.total <- lfcShrink(dds.total, coef="Condition_ERBB2_vs_GFP", type="apeglm")
+resLFC.labeled<- lfcShrink(dds.labeled, coef="Condition_ERBB2_vs_GFP", type="apeglm")
+
+# MA plots
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_MAplot_Total.svg", height = 6, width = 6)
+plotMA(resLFC.total, ylim=c(-2,2), main = "ERBB2 vs GFP, Total reads") # shrinking log2FC
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_MAplot_Labeled.svg", height = 6, width = 6)
+plotMA(resLFC.labeled, ylim=c(-2,2), main = "ERBB2 vs GFP, Labeled reads") # shrinking log2FC
+#dev.off()
+```
+
+
+## Sanity checks
+The VST normalization looks good.
+```{r sanitycheck, echo=FALSE, message=FALSE, warning=FALSE}
+meanSdPlot(assay(vsd.total))
+meanSdPlot(assay(vsd.labeled))
+```
+
+```{r CookDistance, echo=FALSE, message=FALSE, warning=FALSE}
+# check cooks distance
+boxplot(log10(assays(dds.total)[["cooks"]]), range=0, las=2, 
+        main = "Distribution of Cook distances in Total RNA")
+boxplot(log10(assays(dds.labeled)[["cooks"]]), range=0, las=2, 
+        main = "Distribution of Cook distances in SLAM-seq")
+```
+
+
+```{r dispersionestimates, echo=FALSE, message=FALSE, warning=FALSE}
+# per-gene dispersion estimates together with the fitted mean-dispersion relationship.
+# black points that are circled in blue = outliers
+plotDispEsts(dds.total, main = "Dispersion estimates Total RNA")
+plotDispEsts(dds.labeled, main = "Dispersion estimates SLAM-seq")
+```
+
+
+As a sanity check, the histograms of p-value distributions have nice shapes.
+```{r pvalhist, echo=FALSE, message=FALSE, warning=FALSE}
+hist(res.total[res.total$baseMean > 1, "pvalue"], main = "Histogram of p-values (total reads)")
+hist(res.labeled[res.labeled$baseMean > 1, "pvalue"], main = "Histogram of p-values (labeled reads)")
+```
+```{r annotate, include=FALSE, message=FALSE, warning=FALSE}
+#ann <- select(org.Mm.eg.db,
+#              keys=geneInfo$Gene,
+#              columns=c("ENTREZID","SYMBOL","GENENAME"),
+#              keytype = "ENSEMBL")
+
+res.total$ENSEMBL <- rownames(res.total)
+res.labeled$ENSEMBL <- rownames(res.labeled)
+resLFC.total$ENSEMBL <- rownames(resLFC.total)
+resLFC.labeled$ENSEMBL <- rownames(resLFC.labeled)
+
+res.total <- merge(as.data.frame(res.total), geneInfo, by.x = "ENSEMBL", by.y = "Gene", all.x = TRUE)
+res.labeled <- merge(as.data.frame(res.labeled), geneInfo, by.x = "ENSEMBL", by.y = "Gene", all.x = TRUE)
+resLFC.total <- merge(as.data.frame(resLFC.total), geneInfo, by.x = "ENSEMBL", by.y = "Gene", all.x = TRUE)
+resLFC.labeled <- merge(as.data.frame(resLFC.labeled), geneInfo, by.x = "ENSEMBL", by.y = "Gene", all.x = TRUE) 
+
+
+# Save results
+write.table(res.total, "Differential.Expression/ERBB2_vs_GFP_DifferentialExpression_ERBB2_vs_GFP_TotalReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(res.labeled, "Differential.Expression/ERBB2_vs_GFP/DifferentialExpression_ERBB2_vs_GFP_SlamReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(resLFC.total, "Differential.Expression/ERBB2_vs_GFP/DifferentialExpression_ERBB2_vs_GFP_lfcShrinkage_TotalReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(resLFC.labeled, "Differential.Expression/ERBB2_vs_GFP/DifferentialExpression_ERBB2_vs_GFP_lfcShrinkage_SlamReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+saveRDS(dds.total, "Differential.Expression/ERBB2_vs_GFP/DifferentialExpression_DDSobject_ERBB2-GFP_TotalReads.rds")
+saveRDS(dds.labeled, "Differential.Expression/ERBB2_vs_GFP/DifferentialExpression_DDSobject_ERBB2-GFP_SlamReads.rds")
+```
+
+
+## Visualizing differentially expressed genes
+```{r volcano, echo=FALSE, warning=FALSE, message=FALSE, warning=FALSE}
+resLFC.total <- as.data.frame(resLFC.total)
+resLFC.labeled <- as.data.frame(resLFC.labeled)
+
+v1 <- ggplot(resLFC.total[complete.cases(resLFC.total),], 
+             aes(x = log2FoldChange, y = -log10(padj),
+                 color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol == "Erbb2", "Erbb2", "")),
+                   max.overlaps = 200, min.segment.length = 0.01)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Total reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "bottom")
+
+v2 <- ggplot(resLFC.labeled[complete.cases(resLFC.labeled),], 
+             aes(x = log2FoldChange, y = -log10(padj), 
+                 color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol == "Erbb2", "Erbb2", "")),
+                   max.overlaps = 200, min.segment.length = 0.01)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Labeled reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "bottom")
+
+#png("~/Desktop//ERBB2_vs_GFP_DEGs_Volcano.png", height = 10, width = 14, res = 500, units = "cm")
+cowplot::plot_grid(plotlist = list(v1, v2), ncol = 2, nrow = 1)
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_DEGs_Volcano_Total.svg", height = 6, width = 6)
+#v1
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_DEGs_Volcano_Labeled.svg", height = 6, width = 6)
+#v2
+#dev.off()
+```
+
+```{r GeneHeatmap, echo=FALSE, message=FALSE, warning=FALSE}
+DEG.total <- resLFC.total %>%
+  filter(padj < 0.1) %>%
+  pull(ENSEMBL)
+DEG.labeled <- resLFC.labeled %>%
+  filter(padj < 0.1) %>%
+  pull(ENSEMBL)
+
+keep.total <- which(rownames(vsd.total) %in% DEG.total)
+keep.labeled <- which(rownames(vsd.labeled) %in% DEG.labeled)
+
+scaled.total <- scale(t(assay(vsd.total)[keep.total,]))
+scaled.labeled <- scale(t(assay(vsd.labeled)[keep.labeled,]))
+
+annoDF <- as.data.frame(coldata$Condition)
+colnames(annoDF) <- "Condition"
+rownames(annoDF) <- rownames(coldata)
+annoCol<-list(Condition=c(GFP="#117733", ERBB2="#DDAA33"))
+
+# Gene clusters
+gene_cluster_total<- pheatmap(t(scaled.total), 
+                               cluster_rows = TRUE, 
+                               show_rownames = FALSE,
+                               cluster_cols = TRUE, 
+                               annotation_col = annoDF, 
+                               annotation_colors = annoCol,
+                               breaks = seq(-2, 2, length = 101),
+                               main = "ERBB2 vs GFP, total reads")
+#gene_cluster_total <- sort(cutree(gene_cluster_total$tree_row, k=4))
+gene_cluster_labeled <-pheatmap(t(scaled.labeled), 
+                                    cluster_rows = TRUE,
+                                    show_rownames = FALSE,
+                                    cluster_cols = TRUE,
+                                    annotation_col = annoDF, 
+                                    annotation_colors = annoCol,
+                                    breaks = seq(-2, 2, length = 101),
+                                    main = "ERBB2 vs GFP, labeled reads")
+#gene_cluster_labeled <- sort(cutree(gene_cluster_labeled$tree_row, k=4))
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_DEGs_Heatmap_Total.svg", height = 6, width = 6)
+#gene_cluster_total
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_DEGs_Heatmap_Labeled.svg", height = 6, width = 6)
+#gene_cluster_labeled
+#dev.off()
+
+# ComplexHeatmap for better visualization
+library(ComplexHeatmap)
+column_ha <- HeatmapAnnotation(Condition = annoDF$Condition, col = list(Condition = c(colores)))
+#pdf("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Labeled_Heatmap.pdf", height = 4, width = 5)
+Heatmap(t(scaled.labeled), name = "z-score", show_row_names = FALSE, top_annotation = column_ha, show_column_names = FALSE)
+#dev.off()
+```
+
+
+## Comparison between SLAM-seq and total RNA
+```{r comparison, echo=FALSE, warning=FALSE}
+compareDF <- merge(resLFC.labeled, resLFC.total,
+                   by = c("ENSEMBL", "Symbol", "Length"),
+                   all = TRUE)
+colnames(compareDF) <- c("ENSEMBL", "Symbol", "Length", 
+                         "baseMean_labeled", "log2FoldChange_labeled", 
+                         "lfcSE_labeled", "pvalue_labeled", "padj_labeled",
+                         "baseMean_total", "log2FoldChange_total", "lfcSE_total",
+                         "pvalue_total", "padj_total")
+comparePlot <- ggplot(compareDF, aes(x = log2FoldChange_total, y = log2FoldChange_labeled)) +
+  geom_point(color = "#DDAA33") + 
+  theme_classic() +
+  xlab("Log2FC with total reads") +
+  ylab("Log2FC with labeled reads") +
+  ggtitle("ERBB2 vs GFP") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+
+comparePlot
+cor.test(compareDF$log2FoldChange_labeled, compareDF$log2FoldChange_total, method = "pearson")
+
+compareDF$padj_labeled[is.na(compareDF$padj_labeled)] <- 1
+compareDF$padj_total[is.na(compareDF$padj_total)] <- 1
+
+totalUP <- compareDF %>%
+  filter(padj_total < 0.1 & log2FoldChange_total > 0) %>%
+  pull(ENSEMBL)
+  
+totalDOWN <- compareDF %>%
+  filter(padj_total < 0.1 & log2FoldChange_total < 0) %>%
+  pull(ENSEMBL)
+
+labeledUP <- compareDF %>%
+  filter(padj_labeled < 0.1 & log2FoldChange_labeled > 0) %>%
+  pull(ENSEMBL)
+  
+labeledDOWN <- compareDF %>%
+  filter(padj_labeled < 0.1 & log2FoldChange_labeled < 0) %>%
+  pull(ENSEMBL)
+  
+print(paste0("TotalUP & LabeledUP: ", length(intersect(labeledUP, totalUP))))
+print(paste0("TotalDOWN & LabeledUP: ", length(intersect(labeledUP, totalDOWN))))
+print(paste0("TotalUP & LabeledDOWN: ", length(intersect(labeledDOWN, totalUP))))
+print(paste0("TotalDOWN & LabeledDOWN: ", length(intersect(labeledDOWN, totalDOWN))))
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_DEGs_Scatterplot_Comparison_Total_vs_Labeled.svg",
+#    height = 6, width = 6)
+#comparePlot
+#dev.off()
+```
+
+# Validation of targets
+## Targets described in the Aharonov et al, 2020 paper.
+Paper: Aharonov A, Shakked A, Umansky KB, Savidor A, Genzelinakh A, Kain D, Lendengolts D, Revach OY, Morikawa Y, Dong J, Levin Y, Geiger B, Martin JF & Tzahor E. ERBB2 drives YAP activation and EMT-like processes during cardiac regeneration. Nat Cell Biol 2020,22:1346-1356. doi: [10.1038/s41556-020-00588-4](https://doi.org/10.1038/s41556-020-00588-4)
+```{r Heatmap_validate_paper, echo=FALSE, message=FALSE, warning=FALSE}
+paperUP <- readRDS("Differential.Expression/Aharonov2020_ERBB2_UpregulatedGenes.rds")
+
+valid.total <- resLFC.total %>%
+  filter(is.element(Symbol, paperUP))
+valid.labeled <- resLFC.labeled %>%
+  filter(is.element(Symbol, paperUP))
+
+keep.total <- valid.total$ENSEMBL
+keep.labeled <- valid.labeled$ENSEMBL
+keep.total <- which(rownames(vsd.total) %in% keep.total)
+keep.labeled <- which(rownames(vsd.labeled) %in% keep.labeled)
+
+scaled.total <- scale(t(assay(vsd.total)[keep.total,]))
+scaled.labeled <- scale(t(assay(vsd.labeled)[keep.labeled,]))
+
+colnames(scaled.total) <- geneInfo[geneInfo$Gene %in% colnames(scaled.total), "Symbol"]
+colnames(scaled.labeled) <- geneInfo[geneInfo$Gene %in% colnames(scaled.labeled), "Symbol"]
+
+annoRowDF <- data.frame(Aharonov2020 = rep("Upregulated", length(paperUP)))
+colnames(annoRowDF) <- "Aharonov2020"
+rownames(annoRowDF) <- paperUP
+annoCol2 <-list(Condition=c(GFP="#117733", ERBB2="#DDAA33"),
+                Aharonov2020=c(Upregulated="tomato3"))
+
+heatmapT <- pheatmap(t(scaled.total), 
+         cluster_rows=TRUE, 
+         show_rownames=FALSE,
+         cluster_cols=TRUE, 
+         annotation_col = annoDF, 
+         annotation_row = annoRowDF,
+         annotation_colors = annoCol2,
+         breaks = seq(-2, 2, length = 101),
+         main = "Genes from Aharonov et al 2020, total reads")
+heatmapL <-pheatmap(t(scaled.labeled), 
+         cluster_rows=TRUE, 
+         show_rownames=FALSE,
+         cluster_cols=TRUE, 
+         annotation_col=annoDF, 
+         annotation_row = annoRowDF,
+         annotation_colors = annoCol2,
+         breaks = seq(-2, 2, length = 101),
+         main = "Genes from Aharonov et al 2020, labeled reads")
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Aharonov2020_genes_Heatmap_Total.svg", height = 6, width = 6)
+#heatmapT
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Aharonov2020_genes_Heatmap_Labeled.svg", height = 6, width = 6)
+#heatmapL
+#dev.off()
+```
+```{r volcano_validate_paper, echo=FALSE, message=FALSE, warning=FALSE}
+# Volcano with labels
+volcanoT <- ggplot(resLFC.total[complete.cases(resLFC.total),], 
+       aes(x = log2FoldChange, y = -log10(padj), 
+           color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol %in% paperUP, 
+                                    as.character(Symbol),'')),max.overlaps = 1000)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Genes from Aharonov et al 2020, total reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+volcanoL <- ggplot(resLFC.labeled[complete.cases(resLFC.labeled),], 
+       aes(x = log2FoldChange, y = -log10(padj), 
+           color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol %in% paperUP,
+                                    as.character(Symbol),'')),max.overlaps = 100)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Genes from Aharonov et al 2020, labeled reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Aharonov2020_genes_Volcano_Total.svg",
+#    height = 6, width = 6)
+volcanoT
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Aharonov2020_genes_Volcano_Labeled.svg",
+#    height = 6, width = 6)
+volcanoL
+#dev.off()
+```
+```{r ExprPlot_validate_paper, echo=FALSE, message=FALSE, warning=FALSE}
+candidates <- c(
+  geneInfo %>%
+    filter(is.element(Symbol, c(paperUP, "Erbb2"))) %>%
+    pull(Gene, Symbol)
+)
+
+# Plot only those candidates that are significant in labeled or total.
+keep.total <- resLFC.total %>% 
+  filter(is.element(ENSEMBL, candidates)) %>% 
+  filter(padj < 0.1) %>% 
+  pull(ENSEMBL, Symbol)
+
+keep.labeled <- resLFC.labeled %>% 
+  filter(is.element(ENSEMBL, candidates)) %>% 
+  filter(padj < 0.1) %>% 
+  pull(ENSEMBL, Symbol)
+
+candidates <- c(keep.total, keep.labeled)
+candidates <- candidates[unique(names(candidates))]
+
+#pdf("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Aharanov2020_genes_DEGs_Dotplot.pdf",
+#    height = 6, width = 8)
+for(i in 1:length(candidates)){
+  log2fc.total <- resLFC.total %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(log2FoldChange) 
+  log2fc.labeled <- resLFC.labeled %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(log2FoldChange) 
+  padj.total <- resLFC.total %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(padj)
+  padj.labeled <- resLFC.labeled %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(padj)
+  
+  if(candidates[i] %in% rownames(dds.total)){
+    plot.total <- plotCounts(dds.total, gene = candidates[i], intgroup = "Condition", returnData = TRUE)
+    plot.total <- ggplot(plot.total, aes(x = Condition, y = count, color = Condition, fill = Condition)) +
+      geom_point(position=position_jitter(w=0.1,h=0)) +
+      scale_color_manual(values = colores) +
+      theme_classic() +
+      xlab("Condition") + 
+      ylab("Normalized counts") +
+      ggtitle(paste0(names(candidates)[i], " (Total counts)"))+
+      labs(subtitle = paste0("Log2FC vs GFP = ", round(log2fc.total, 2), 
+                             "; adj.p = ", round(padj.total, 3), ")"))+
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+            plot.subtitle = element_text(hjust = 0.5),
+            legend.position = "bottom")
+  }
+  if(candidates[i] %in% rownames(dds.labeled)){
+    plot.labeled <-plotCounts(dds.labeled, gene = candidates[i], intgroup = "Condition", returnData = TRUE)
+    plot.labeled <- ggplot(plot.labeled, aes(x = Condition, y = count, color = Condition, fill = Condition)) +
+      geom_point(position=position_jitter(w=0.1,h=0)) +
+      scale_color_manual(values = colores) +
+      theme_classic() +
+      xlab("Condition") + 
+      ylab("Normalized counts") +
+      ggtitle(paste0(names(candidates)[i], " (Labeled counts)"))+
+      labs(subtitle = paste0("Log2FC vs GFP = ", round(log2fc.labeled, 2),
+                             "; adj.p = ", round(padj.labeled, 3), ")"))+
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+            plot.subtitle = element_text(hjust = 0.5),
+            legend.position = "bottom")
+  }
+  
+  print(cowplot::plot_grid(plotlist = list(plot.total, plot.labeled), ncol = 2))
+}
+#dev.off()
+```
+
+
+## Targets in the OmnipathR database
+As Erbb2 is a receptor, I used the OmnipathR database to find the genes downstream of Erbb2 in the intracellular signaling cascade (Erbb2 > transcriptional regulators > target genes).
+```{r Heatmap_validate_collectri, echo=FALSE, message=FALSE, warning=FALSE}
+# Get OmnipathR, find TFs downstream of Erbb2 and their corresponding targets
+AllInteractions <- 
+    OmnipathR::import_post_translational_interactions(exclude = "ligrecextra", 
+                                                      organism = 10090)
+# Get direct Erbb2 targets
+ERBB2targets <- AllInteractions %>%
+  dplyr::filter(source_genesymbol == "Erbb2") %>%
+  pull(target_genesymbol) %>%
+  unique()
+
+# Get transcriptional targets of Erbb2 target genes
+collecTRI <- readRDS("CollecTRI_FromOmnipathR_Mouse_Loops_38823edges_Downloaded2023-11-08.rds")
+collectri <- collecTRI[collecTRI$source_genesymbol %in% ERBB2targets, ]
+
+collectriPOS <- collectri %>%
+  filter(consensus_stimulation == 1) %>%
+  pull(target_genesymbol)
+collectriNEG <- collectri %>%
+  filter(consensus_inhibition == 1) %>%
+  pull(target_genesymbol)
+
+# some genes are both positive and negative
+collectriBOTH <- intersect(collectriNEG, collectriPOS)
+collectriPOS <- setdiff(collectriPOS, collectriBOTH)
+collectriNEG <- setdiff(collectriNEG, collectriBOTH)
+
+valid.total <- resLFC.total %>%
+  filter(is.element(Symbol, c(collectriPOS, collectriNEG, collectriBOTH)))
+valid.labeled <- resLFC.labeled %>%
+  filter(is.element(Symbol, c(collectriPOS, collectriNEG, collectriBOTH)))
+
+keep.total <- valid.total$ENSEMBL
+keep.labeled <- valid.labeled$ENSEMBL
+keep.total <- which(rownames(vsd.total) %in% keep.total)
+keep.labeled <- which(rownames(vsd.labeled) %in% keep.labeled)
+
+scaled.total <- scale(t(assay(vsd.total)[keep.total,]))
+scaled.labeled <- scale(t(assay(vsd.labeled)[keep.labeled,]))
+
+colnames(scaled.total) <- geneInfo[geneInfo$Gene %in% colnames(scaled.total), "Symbol"]
+colnames(scaled.labeled) <- geneInfo[geneInfo$Gene %in% colnames(scaled.labeled), "Symbol"]
+
+# Problemas a partir de aqui!! algo con los rownames de annRowDF.
+annoRowDF <- data.frame(Regulation = c(rep("Activation", length(collectriPOS)),
+                                       rep("Inhibition", length(collectriNEG)),
+                                       rep("Both", length(collectriBOTH))))
+colnames(annoRowDF) <- "Regulation"
+rownames(annoRowDF) <- c(collectriPOS, collectriNEG, collectriBOTH)
+annoCol2 <-list(Condition=c(GFP="#117733", ERBB2="#DDAA33"),
+                Regulation=c(Activation="tomato3", Inhibition="steelblue4", Both = "grey70"))
+
+heatmapT <-pheatmap(t(scaled.total), 
+         cluster_rows=TRUE, 
+         show_rownames=FALSE,
+         cluster_cols=TRUE, 
+         annotation_col = annoDF, 
+         annotation_row = annoRowDF,
+         annotation_colors = annoCol2,
+         breaks = seq(-2, 2, length = 101),
+         main = "Erbb2 targets in CollecTRI, total reads")
+heatmapL <- pheatmap(t(scaled.labeled), 
+         cluster_rows=TRUE, 
+         show_rownames=FALSE,
+         cluster_cols=TRUE, 
+         annotation_col=annoDF, 
+         annotation_row = annoRowDF,
+         annotation_colors = annoCol2,
+         breaks = seq(-2, 2, length = 101),
+         main = "Erbb2 targets in CollecTRI, labeled reads")
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_CollecTRI_Heatmap_Total.svg",
+#    height = 6, width = 8)
+#heatmapT
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_CollecTRI_Heatmap_Labeled.svg",
+#    height = 6, width = 8)
+#heatmapL
+#dev.off()
+```
+```{r volcano_validate_collectri, echo=FALSE, message=FALSE, warning=FALSE}
+# Volcano with labels
+volcanoT <- ggplot(resLFC.total[complete.cases(resLFC.total),], 
+       aes(x = log2FoldChange, y = -log10(padj), 
+           color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol %in% c(collectriPOS, collectriNEG, collectriBOTH),
+                                    as.character(Symbol),'')),max.overlaps = 100)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Erbb2 targets in CollecTRI, total reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+volcanoL <- ggplot(resLFC.labeled[complete.cases(resLFC.labeled),], 
+       aes(x = log2FoldChange, y = -log10(padj), 
+           color = ifelse(padj < 0.1, "padj < 0.1", "padj >= 0.1"))) +
+  geom_point() +
+  geom_label_repel(aes(label=ifelse(Symbol %in% c(collectriPOS, collectriNEG, collectriBOTH),
+                                    as.character(Symbol),'')),max.overlaps = 100)+
+  xlim(c(-10,10)) +
+  ylim(c(0,20))+
+  theme_classic() +
+  xlab("Log2FC") +
+  ylab("-log10(adjusted p-value)") +
+  ggtitle("Erbb2 targets in CollecTRI, labeled reads") +
+  scale_color_manual(name = "Adjusted p-value", values = c("#DDAA33", "grey80")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_CollecTRI_Volcano_Total.svg",
+#    height = 6, width = 6)
+#volcanoT
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_CollecTRI_Volcano_Labeled.svg",
+#    height = 6, width = 6)
+#volcanoL
+#dev.off()
+
+cowplot::plot_grid(plotlist = list(volcanoT, volcanoL), ncol = 2)
+```
+```{r ExprPlot_validate_collectri, echo=FALSE, message=FALSE, warning=FALSE}
+# Compare gene by gene.
+candidates <- c(
+  geneInfo %>%
+    filter(is.element(Symbol, c(collectriPOS, collectriNEG, collectriBOTH))) %>%
+    pull(Gene, Symbol)
+)
+
+# Plot only those candidates that are significant in labeled or total.
+keep.total <- resLFC.total %>% 
+  filter(is.element(ENSEMBL, candidates)) %>% 
+  filter(padj < 0.1) %>% 
+  pull(ENSEMBL, Symbol)
+
+keep.labeled <- resLFC.labeled %>% 
+  filter(is.element(ENSEMBL, candidates)) %>% 
+  filter(padj < 0.1) %>% 
+  pull(ENSEMBL, Symbol)
+
+candidates <- c(keep.total, keep.labeled)
+candidates <- candidates[unique(names(candidates))]
+
+#pdf("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_CollecTRI_DEGs_Dotplot.pdf",
+#    height = 6, width = 8)
+for(i in 1:length(candidates)){
+  log2fc.total <- resLFC.total %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(log2FoldChange) 
+  log2fc.labeled <- resLFC.labeled %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(log2FoldChange) 
+  padj.total <- resLFC.total %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(padj)
+  padj.labeled <- resLFC.labeled %>%
+    filter(ENSEMBL == candidates[i]) %>%
+    pull(padj)
+  
+  if(candidates[i] %in% rownames(dds.total)){
+    plot.total <- plotCounts(dds.total, gene = candidates[i], intgroup = "Condition", returnData = TRUE)
+    plot.total <- ggplot(plot.total, aes(x = Condition, y = count, color = Condition, fill = Condition)) +
+      geom_point(position=position_jitter(w=0.1,h=0)) +
+      scale_color_manual(values = colores) +
+      theme_classic() +
+      xlab("Condition") + 
+      ylab("Normalized counts") +
+      ggtitle(paste0(names(candidates)[i], " (Total counts)"))+
+      labs(subtitle = paste0("Log2FC vs GFP = ", round(log2fc.total, 2), 
+                             "; adj.p = ", round(padj.total, 3), ")"))+
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+            plot.subtitle = element_text(hjust = 0.5),
+            legend.position = "bottom")
+  }
+  if(candidates[i] %in% rownames(dds.labeled)){
+    plot.labeled <-plotCounts(dds.labeled, gene = candidates[i], intgroup = "Condition", returnData = TRUE)
+    plot.labeled <- ggplot(plot.labeled, aes(x = Condition, y = count, color = Condition, fill = Condition)) +
+      geom_point(position=position_jitter(w=0.1,h=0)) +
+      scale_color_manual(values = colores) +
+      theme_classic() +
+      xlab("Condition") + 
+      ylab("Normalized counts") +
+      ggtitle(paste0(names(candidates)[i], " (Labeled counts)"))+
+      labs(subtitle = paste0("Log2FC vs GFP = ", round(log2fc.labeled, 2),
+                             "; adj.p = ", round(padj.labeled, 3), ")"))+
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+            plot.subtitle = element_text(hjust = 0.5),
+            legend.position = "bottom")
+  }
+  
+  print(cowplot::plot_grid(plotlist = list(plot.total, plot.labeled), ncol = 2))
+}
+#dev.off()
+```
+
+
+# GSEA
+```{r load_gsea_pathways, include=FALSE}
+m2 <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m2.cp.reactome.v2023.1.Mm.symbols.gmt")
+m3.gtrd <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m3.gtrd.v2023.1.Mm.symbols.gmt")
+m3.mirdb <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m3.mirdb.v2023.1.Mm.symbols.gmt")
+m5.bp <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m5.go.bp.v2023.1.Mm.symbols.gmt")
+m5.mf <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m5.go.mf.v2023.1.Mm.symbols.gmt")
+m5.cc <- gmtPathways("~/NetVolumes/LAB_MT/RESULTADOS/Ines/MSigDB_Mmusculus/m5.go.cc.v2023.1.Mm.symbols.gmt")
+```
+```{r prepare_ranks, include=FALSE}
+ranks.total <- resLFC.total$log2FoldChange
+names(ranks.total) <- resLFC.total$Symbol
+ranks.total <- sort(ranks.total)
+
+ranks.labeled <- resLFC.labeled$log2FoldChange
+names(ranks.labeled) <- resLFC.labeled$Symbol
+ranks.labeled <- sort(ranks.labeled)
+```
+```{r gsea_m2, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m2.total <- fgsea(pathways = m2, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m2.labeled <- fgsea(pathways = m2, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m2.total$leadingEdge = sapply(GSEA.m2.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m2.labeled$leadingEdge = sapply(GSEA.m2.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m2.total, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_M2CanonicalPathways_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m2.labeled, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_M2CanonicalPathways_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot
+GSEA.m2.total$SignedLogPadj <- -log10(GSEA.m2.total$padj)
+GSEA.m2.total$SignedLogPadj <- ifelse(GSEA.m2.total$NES > 0, 
+                                      GSEA.m2.total$SignedLogPadj,
+                                      -GSEA.m2.total$SignedLogPadj)
+
+GSEA.m2.labeled$SignedLogPadj <- -log10(GSEA.m2.labeled$padj)
+GSEA.m2.labeled$SignedLogPadj <- ifelse(GSEA.m2.labeled$NES > 0, 
+                                      GSEA.m2.labeled$SignedLogPadj,
+                                      -GSEA.m2.labeled$SignedLogPadj)
+GSEA.m2.total$Category <- "Not significant"
+GSEA.m2.total[GSEA.m2.total$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m2.total[GSEA.m2.total$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+GSEA.m2.labeled$Category <- "Not significant"
+GSEA.m2.labeled[GSEA.m2.labeled$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m2.labeled[GSEA.m2.labeled$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+# Manually make names of pathways shorter and nicer for plotting
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_FORMATION_OF_A_POOL_OF_FREE_40S_SUBUNITS", 
+              "PrettyNames"] <- "Pooling of free 40S subunits"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_NONSENSE_MEDIATED_DECAY_NMD_INDEPENDENT_OF_THE_EXON_JUNCTION_COMPLEX_EJC", 
+              "PrettyNames"] <- "EJC-independent NMD"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_MAJOR_PATHWAY_OF_RRNA_PROCESSING_IN_THE_NUCLEOLUS_AND_CYTOSOL", 
+              "PrettyNames"] <- "rRNA processing"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_EUKARYOTIC_TRANSLATION_INITIATION", 
+              "PrettyNames"] <- "Translation initiation"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_NONSENSE_MEDIATED_DECAY_NMD", 
+              "PrettyNames"] <- "NMD"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_PYRUVATE_METABOLISM_AND_CITRIC_ACID_TCA_CYCLE", 
+              "PrettyNames"] <- "Pyruvate metabolism and TCA cycle"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_CARDIAC_CONDUCTION", 
+              "PrettyNames"] <- "Cardiac conduction"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_THE_CITRIC_ACID_TCA_CYCLE_AND_RESPIRATORY_ELECTRON_TRANSPORT", 
+              "PrettyNames"] <- "Respiratory electron transport"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_CITRIC_ACID_CYCLE_TCA_CYCLE", 
+              "PrettyNames"] <- "TCA cycle"
+GSEA.m2.total[GSEA.m2.total$pathway == "REACTOME_MUSCLE_CONTRACTION", 
+              "PrettyNames"] <- "Muscle contraction"
+
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_MAJOR_PATHWAY_OF_RRNA_PROCESSING_IN_THE_NUCLEOLUS_AND_CYTOSOL", 
+              "PrettyNames"] <- "rRNA processing"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_NONSENSE_MEDIATED_DECAY_NMD_INDEPENDENT_OF_THE_EXON_JUNCTION_COMPLEX_EJC", 
+              "PrettyNames"] <- "EJC-independent NMD"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_FORMATION_OF_A_POOL_OF_FREE_40S_SUBUNITS", 
+              "PrettyNames"] <- "Pooling of free 40S subunits"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_EUKARYOTIC_TRANSLATION_INITIATION", 
+              "PrettyNames"] <- "Translation initiation"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_NONSENSE_MEDIATED_DECAY_NMD", 
+              "PrettyNames"] <- "NMD"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_MUSCLE_CONTRACTION", 
+              "PrettyNames"] <- "Muscle contraction"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_CARDIAC_CONDUCTION", 
+              "PrettyNames"] <- "Cardiac conduction"
+GSEA.m2.labeled[GSEA.m2.labeled$pathway == "REACTOME_PHASE_2_PLATEAU_PHASE", 
+              "PrettyNames"] <- "Plateau phase of muscle contraction"
+
+
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M2CanonicalPathways_Total.svg", height = 6, width = 12)
+ggplot(GSEA.m2.total, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-16, 16), breaks = seq(-16, 16, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M2CanonicalPathways_Labeled.svg", height = 6, width = 12)
+ggplot(GSEA.m2.labeled, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = 10000,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = 10000,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-16, 16), breaks = seq(-16, 16, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+totalm2D <- GSEA.m2.total %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES < 0) %>%
+  pull(pathway)
+labeledm2D <- GSEA.m2.labeled %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES < 0) %>%
+  pull(pathway)
+totalm2U <- GSEA.m2.total %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES > 0) %>%
+  pull(pathway)
+labeledm2U <- GSEA.m2.labeled %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES > 0) %>%
+  pull(pathway)
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M2CanonicalPathway_Venn_Total_vsLabeled_DOWN.svg",
+#    height = 6, width = 6)
+ggvenn(data = list(`Total` = totalm2D, `Labeled`= labeledm2D),
+       fill_color = c("lightblue", "blue"), auto_scale = TRUE, show_percentage = FALSE, text_size = 8)
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M2CanonicalPathway_Venn_Total_vsLabeled_UP.svg",
+#    height = 6, width = 6)
+ggvenn(data = list(`Total` = totalm2U, `Labeled`= labeledm2U),
+       fill_color = c("pink", "red"), auto_scale = TRUE, show_percentage = FALSE, text_size = 8)
+#dev.off()
+```
+```{r gsea_m3TF, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m3TF.total <- fgsea(pathways = m3.gtrd, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m3TF.labeled <- fgsea(pathways = m3.gtrd, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m3TF.total$leadingEdge = sapply(GSEA.m3TF.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m3TF.labeled$leadingEdge = sapply(GSEA.m3TF.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m3TF.total, 
+            "Differential.Expression/GSEA_ERBB2_vs_GFP_MSigDB_M3TF_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m3TF.labeled, 
+            "Differential.Expression/GSEA_ERBB2_vs_GFP_MSigDB_M3TF_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot - no significant TFs so we don't plot anything
+```
+```{r gsea_m3mir, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m3mir.total <- fgsea(pathways = m3.mirdb, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m3mir.labeled <- fgsea(pathways = m3.mirdb, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m3mir.total$leadingEdge = sapply(GSEA.m3mir.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m3mir.labeled$leadingEdge = sapply(GSEA.m3mir.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m3mir.total, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_M3MIR_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m3mir.labeled, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_M3MIR_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot
+GSEA.m3mir.total$SignedLogPadj <- -log10(GSEA.m3mir.total$padj)
+GSEA.m3mir.total$SignedLogPadj <- ifelse(GSEA.m3mir.total$NES > 0, 
+                                      GSEA.m3mir.total$SignedLogPadj,
+                                      -GSEA.m3mir.total$SignedLogPadj)
+
+GSEA.m3mir.labeled$SignedLogPadj <- -log10(GSEA.m3mir.labeled$padj)
+GSEA.m3mir.labeled$SignedLogPadj <- ifelse(GSEA.m3mir.labeled$NES > 0, 
+                                      GSEA.m3mir.labeled$SignedLogPadj,
+                                      -GSEA.m3mir.labeled$SignedLogPadj)
+GSEA.m3mir.total$Category <- "Not significant"
+GSEA.m3mir.total[GSEA.m3mir.total$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m3mir.total[GSEA.m3mir.total$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+GSEA.m3mir.labeled$Category <- "Not significant"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+# Manually make names of pathways shorter and nicer for plotting
+GSEA.m3mir.total[GSEA.m3mir.total$pathway == "MIR_504_3P", 
+              "PrettyNames"] <- "MIR504"
+GSEA.m3mir.total[GSEA.m3mir.total$pathway == "MIR_7056_5P", 
+              "PrettyNames"] <- "MIR7056"
+GSEA.m3mir.total[GSEA.m3mir.total$pathway == "MIR_12185_3P", 
+              "PrettyNames"] <- "MIR12185"
+GSEA.m3mir.total[GSEA.m3mir.total$pathway == "MIR_199A_5P_MIR_199B_5P", 
+              "PrettyNames"] <- "MIR199"
+GSEA.m3mir.total[GSEA.m3mir.total$pathway == "MIR_7075_5P", 
+              "PrettyNames"] <- "MIR7075"
+
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$pathway == "MIR_764_3P", 
+              "PrettyNames"] <- "MIR764"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$pathway == "MIR_7075_5P", 
+              "PrettyNames"] <- "MIR7075"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$pathway == "MIR_7076_5P", 
+              "PrettyNames"] <- "MIR7076"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$pathway == "MIR_219A_5P", 
+              "PrettyNames"] <- "MIR219A"
+GSEA.m3mir.labeled[GSEA.m3mir.labeled$pathway == "MIR_6987_5P", 
+              "PrettyNames"] <- "MIR6987"
+
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M3MIR_Total.svg", height = 6, width = 12)
+ggplot(GSEA.m3mir.total, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "grey70")) +
+  scale_y_continuous(limits = c(-4, 4), breaks = seq(-4, 4, 1))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_M3MIR_Labeled.svg", height = 6, width = 12)
+ggplot(GSEA.m3mir.labeled, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = 10000,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = 10000,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "grey70")) +
+  scale_y_continuous(limits = c(-4, 4), breaks = seq(-4, 4, 1))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+```
+```{r gsea_m5bp, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m5bp.total <- fgsea(pathways = m5.bp, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m5bp.labeled <- fgsea(pathways = m5.bp, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m5bp.total$leadingEdge = sapply(GSEA.m5bp.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m5bp.labeled$leadingEdge = sapply(GSEA.m5bp.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m5bp.total, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOBiologicalProcess_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m5bp.labeled, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOBiologicalProcess_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot
+GSEA.m5bp.total$SignedLogPadj <- -log10(GSEA.m5bp.total$padj)
+GSEA.m5bp.total$SignedLogPadj <- ifelse(GSEA.m5bp.total$NES > 0, 
+                                      GSEA.m5bp.total$SignedLogPadj,
+                                      -GSEA.m5bp.total$SignedLogPadj)
+
+GSEA.m5bp.labeled$SignedLogPadj <- -log10(GSEA.m5bp.labeled$padj)
+GSEA.m5bp.labeled$SignedLogPadj <- ifelse(GSEA.m5bp.labeled$NES > 0, 
+                                      GSEA.m5bp.labeled$SignedLogPadj,
+                                      -GSEA.m5bp.labeled$SignedLogPadj)
+GSEA.m5bp.total$Category <- "Not significant"
+GSEA.m5bp.total[GSEA.m5bp.total$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5bp.total[GSEA.m5bp.total$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+GSEA.m5bp.labeled$Category <- "Not significant"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+# Manually make names of pathways shorter and nicer for plotting
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_CYTOPLASMIC_TRANSLATION", 
+              "PrettyNames"] <- "Translation"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_HUMORAL_IMMUNE_RESPONSE", 
+              "PrettyNames"] <- "Humoral immune response"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_NEGATIVE_REGULATION_OF_VIRAL_PROCESS", 
+              "PrettyNames"] <- "Regulation of viral process"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_COMPLEMENT_ACTIVATION", 
+              "PrettyNames"] <- "Complement activation"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_FAT_SOLUBLE_VITAMIN_METABOLIC_PROCESS", 
+              "PrettyNames"] <- "Fat-soluble vitamin metabolism"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_STRIATED_MUSCLE_CONTRACTION", 
+              "PrettyNames"] <- "Muscle contraction"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_CARDIAC_CONDUCTION", 
+              "PrettyNames"] <- "Cardiac conduction"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_SARCOMERE_ORGANIZATION", 
+              "PrettyNames"] <- "Sarcomere organization"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_STRIATED_MUSCLE_CELL_DEVELOPMENT", 
+              "PrettyNames"] <- "Striated muscle development"
+GSEA.m5bp.total[GSEA.m5bp.total$pathway == "GOBP_CELL_COMMUNICATION_INVOLVED_IN_CARDIAC_CONDUCTION", 
+              "PrettyNames"] <- "Cell communication involved in cardiac conduction"
+
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_CYTOPLASMIC_TRANSLATION", 
+              "PrettyNames"] <- "Translation"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_RESPONSE_TO_VIRUS", 
+              "PrettyNames"] <- "Response to virus"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_RESPONSE_TO_TYPE_I_INTERFERON", 
+              "PrettyNames"] <- "Response to type I interferon"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_RIBOSOME_BIOGENESIS", 
+              "PrettyNames"] <- "Ribosome biogenesis"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_INTERFERON_BETA_PRODUCTION", 
+              "PrettyNames"] <- "Interferon beta production"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_CARDIAC_MUSCLE_CELL_CONTRACTION", 
+              "PrettyNames"] <- "Muscle contraction"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_CARDIAC_CONDUCTION", 
+              "PrettyNames"] <- "Cardiac conduction"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_CARDIAC_MUSCLE_CELL_DIFFERENTIATION", 
+              "PrettyNames"] <- "Cardiomyocyte differentiation"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_CARDIAC_CELL_DEVELOPMENT", 
+              "PrettyNames"] <- "Cardiomyocyte development"
+GSEA.m5bp.labeled[GSEA.m5bp.labeled$pathway == "GOBP_MEMBRANE_REPOLARIZATION", 
+              "PrettyNames"] <- "Membrane repolarization"
+
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOBiologicalProcess_Total.svg", height = 6, width = 12)
+ggplot(GSEA.m5bp.total, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-12, 12), breaks = seq(-12, 12, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+pdf("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOBiologicalProcess_Labeled.pdf", height = 4, width = 5)
+ggplot(GSEA.m5bp.labeled, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-7, 7), breaks = seq(-7, 7, 1))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")+
+  theme(legend.position = "none")
+dev.off()  
+
+totalm5bpD <- GSEA.m5bp.total %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES < 0) %>%
+  pull(pathway)
+labeledm5bpD <- GSEA.m5bp.labeled %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES < 0) %>%
+  pull(pathway)
+totalm5bpU <- GSEA.m5bp.total %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES > 0) %>%
+  pull(pathway)
+labeledm5bpU <- GSEA.m5bp.labeled %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::filter(NES > 0) %>%
+  pull(pathway)
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOBiologicalProcess_Venn_Total_vsLabeled_DOWN.svg",
+#    height = 6, width = 6)
+ggvenn(data = list(`Total` = totalm5bpD, `Labeled`= labeledm5bpD),
+       fill_color = c("lightblue", "blue"), auto_scale = TRUE, show_percentage = FALSE, text_size = 8)
+#dev.off()
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOBiologicalProcess_Venn_Total_vsLabeled_UP.svg",
+#    height = 6, width = 6)
+ggvenn(data = list(`Total` = totalm5bpU, `Labeled`= labeledm5bpU),
+       fill_color = c("pink", "red"), auto_scale = TRUE, show_percentage = FALSE, text_size = 8)
+#dev.off()
+```
+```{r gsea_m5mf, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m5mf.total <- fgsea(pathways = m5.mf, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m5mf.labeled <- fgsea(pathways = m5.mf, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m5mf.total$leadingEdge = sapply(GSEA.m5mf.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m5mf.labeled$leadingEdge = sapply(GSEA.m5mf.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m5mf.total, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOMolecularFunction_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m5mf.labeled, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOMolecularFunction_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot
+GSEA.m5mf.total$SignedLogPadj <- -log10(GSEA.m5mf.total$padj)
+GSEA.m5mf.total$SignedLogPadj <- ifelse(GSEA.m5mf.total$NES > 0, 
+                                      GSEA.m5mf.total$SignedLogPadj,
+                                      -GSEA.m5mf.total$SignedLogPadj)
+
+GSEA.m5mf.labeled$SignedLogPadj <- -log10(GSEA.m5mf.labeled$padj)
+GSEA.m5mf.labeled$SignedLogPadj <- ifelse(GSEA.m5mf.labeled$NES > 0, 
+                                      GSEA.m5mf.labeled$SignedLogPadj,
+                                      -GSEA.m5mf.labeled$SignedLogPadj)
+GSEA.m5mf.total$Category <- "Not significant"
+GSEA.m5mf.total[GSEA.m5mf.total$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5mf.total[GSEA.m5mf.total$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+GSEA.m5mf.labeled$Category <- "Not significant"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+# Manually make names of pathways shorter and nicer for plotting
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_STRUCTURAL_CONSTITUENT_OF_RIBOSOME", 
+              "PrettyNames"] <- "Ribosome"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_IMMUNE_RECEPTOR_ACTIVITY", 
+              "PrettyNames"] <- "Immune receptor"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_EXTRACELLULAR_MATRIX_STRUCTURAL_CONSTITUENT_CONFERRING_COMPRESSION_RESISTANCE", 
+              "PrettyNames"] <- "ECM structural constituent"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_SERINE_HYDROLASE_ACTIVITY", 
+              "PrettyNames"] <- "Serine hydrolase"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_ANKYRIN_BINDING", 
+              "PrettyNames"] <- "Ankyrin binding"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_VOLTAGE_GATED_MONOATOMIC_CATION_CHANNEL_ACTIVITY", 
+              "PrettyNames"] <- "Voltage-gated monoatomic cation channel"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_VOLTAGE_GATED_POTASSIUM_CHANNEL_ACTIVITY", 
+              "PrettyNames"] <- "Voltage-gated K+ channel"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_POTASSIUM_ION_TRANSMEMBRANE_TRANSPORTER_ACTIVITY", 
+              "PrettyNames"] <- "K+ transmembrane transporter"
+GSEA.m5mf.total[GSEA.m5mf.total$pathway == "GOMF_LNCRNA_BINDING", 
+              "PrettyNames"] <- "lncRNA binding"
+
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_RRNA_BINDING", 
+              "PrettyNames"] <- "rRNA binding"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_STRUCTURAL_CONSTITUENT_OF_RIBOSOME", 
+              "PrettyNames"] <- "Ribosome"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_MONOATOMIC_ION_TRANSMEMBRANE_TRANSPORTER_ACTIVITY", 
+              "PrettyNames"] <- "Monoatomic ion transmembrane transporter"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_VOLTAGE_GATED_MONOATOMIC_CATION_CHANNEL_ACTIVITY", 
+              "PrettyNames"] <- "Voltage-gated monoatomic cation channel"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_VOLTAGE_GATED_POTASSIUM_CHANNEL_ACTIVITY", 
+              "PrettyNames"] <- "Voltage-gated K+ channel"
+GSEA.m5mf.labeled[GSEA.m5mf.labeled$pathway == "GOMF_ACTIN_FILAMENT_BINDING", 
+              "PrettyNames"] <- "Actin filament binding"
+
+
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOMolecularFunction_Total.svg", height = 6, width = 12)
+ggplot(GSEA.m5mf.total, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-14, 14), breaks = seq(-14, 14, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOMolecularFunction_Labeled.svg", height = 6, width = 12)
+ggplot(GSEA.m5mf.labeled, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-8, 16), breaks = seq(-8, 16, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+```
+```{r gsea_m5cc, echo=FALSE, message=FALSE, warning=FALSE}
+GSEA.m5cc.total <- fgsea(pathways = m5.cc, stats = ranks.total, minSize  = 10, maxSize  = 500)
+GSEA.m5cc.labeled <- fgsea(pathways = m5.cc, stats = ranks.labeled, minSize  = 10, maxSize  = 500)
+
+GSEA.m5cc.total$leadingEdge = sapply(GSEA.m5cc.total$leadingEdge, function(x) paste0(x, collapse = ";"))
+GSEA.m5cc.labeled$leadingEdge = sapply(GSEA.m5cc.labeled$leadingEdge, function(x) paste0(x, collapse = ";"))
+
+write.table(GSEA.m5cc.total, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOCellularCompartment_Total.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+write.table(GSEA.m5cc.labeled, 
+            "Differential.Expression/ERBB2_vs_GFP/GSEA_ERBB2_vs_GFP_MSigDB_GOCellularCompartment_LabeledReads.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+# Rank plot
+GSEA.m5cc.total$SignedLogPadj <- -log10(GSEA.m5cc.total$padj)
+GSEA.m5cc.total$SignedLogPadj <- ifelse(GSEA.m5cc.total$NES > 0, 
+                                      GSEA.m5cc.total$SignedLogPadj,
+                                      -GSEA.m5cc.total$SignedLogPadj)
+
+GSEA.m5cc.labeled$SignedLogPadj <- -log10(GSEA.m5cc.labeled$padj)
+GSEA.m5cc.labeled$SignedLogPadj <- ifelse(GSEA.m5cc.labeled$NES > 0, 
+                                      GSEA.m5cc.labeled$SignedLogPadj,
+                                      -GSEA.m5cc.labeled$SignedLogPadj)
+GSEA.m5cc.total$Category <- "Not significant"
+GSEA.m5cc.total[GSEA.m5cc.total$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5cc.total[GSEA.m5cc.total$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+GSEA.m5cc.labeled$Category <- "Not significant"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$SignedLogPadj > -log10(0.05), "Category"] <- "NES > 0 & padj < 0.05"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$SignedLogPadj < log10(0.05), "Category"] <- "NES < 0 & padj < 0.05"
+
+# Manually make names of pathways shorter and nicer for plotting
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_CYTOSOLIC_RIBOSOME", 
+              "PrettyNames"] <- "Ribosome"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_EXTERNAL_SIDE_OF_PLASMA_MEMBRANE", 
+              "PrettyNames"] <- "External side of plasma membrane"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_MHC_PROTEIN_COMPLEX", 
+              "PrettyNames"] <- "MHC complex"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_COLLAGEN_CONTAINING_EXTRACELLULAR_MATRIX", 
+              "PrettyNames"] <- "Collgen-containing ECM"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_RECEPTOR_COMPLEX", 
+              "PrettyNames"] <- "Receptor complex"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_INTERCALATED_DISC", 
+              "PrettyNames"] <- "Intercalated disk"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_CELL_CELL_CONTACT_ZONE", 
+              "PrettyNames"] <- "Cell-cell contact zome"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_SARCOLEMMA", 
+              "PrettyNames"] <- "Sarcolema"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_T_TUBULE", 
+              "PrettyNames"] <- "T-tubule"
+GSEA.m5cc.total[GSEA.m5cc.total$pathway == "GOCC_CONTRACTILE_FIBER", 
+              "PrettyNames"] <- "Contractile fiber"
+
+
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_RIBOSOMAL_SUBUNIT", 
+              "PrettyNames"] <- "Ribosome"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_CELL_CELL_CONTACT_ZONE", 
+              "PrettyNames"] <- "Cell-cell contact zone"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_INTERCALATED_DISC", 
+              "PrettyNames"] <- "Intercalated disk"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_T_TUBULE", 
+              "PrettyNames"] <- "T-tubule"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_SARCOPLASMIC_RETICULUM", 
+              "PrettyNames"] <- "Sarcoplasmic reticulum"
+GSEA.m5cc.labeled[GSEA.m5cc.labeled$pathway == "GOCC_MYOFILAMENT", 
+              "PrettyNames"] <- "Myofilament"
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOCellularCompartmentBiologicalProcess_Total.svg", height = 6, width = 12)
+ggplot(GSEA.m5cc.total, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-14, 14), breaks = seq(-14, 14, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+
+#svg("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_GSEA_MSigDB_GOCellularCompartment_Labeled.svg", height = 6, width = 12)
+ggplot(GSEA.m5cc.labeled, aes(x = NES, y = SignedLogPadj, color = Category)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = -log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_hline(yintercept = log10(0.05), linetype='dotted', col = 'grey20') +
+  geom_label_repel(aes(label=ifelse(Category == "NES > 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "tomato3")+
+  geom_label_repel(aes(label=ifelse(Category == "NES < 0 & padj < 0.05",
+                                    as.character(PrettyNames),'')),
+                   max.overlaps = Inf,
+                   color = "steelblue4")+
+  theme_classic() +
+  scale_color_manual(values = c("steelblue4", "tomato3", "grey70")) +
+  scale_y_continuous(limits = c(-10, 16), breaks = seq(-10, 16, 2))+
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  xlab("Normalized Enrichment Score") +
+  ylab("Signed -log10(adjusted p-value)")
+#dev.off()  
+```
+```{r closing}
+sessionInfo()
+```
+```{r candidateDF, include=FALSE, eval=FALSE}
+candidates2 <- unique(c(collectriNEG, collectriPOS))
+names(candidates2) <- candidates2
+
+# Evaluate only those genes in geneInfo
+keep <- is.element(candidates2, geneInfo$Symbol)
+candidates2 <- candidates2[keep]
+
+for(i in 1:length(candidates2)){
+  candidates2[i] <- geneInfo[geneInfo$Symbol == names(candidates2)[i], "Gene"]
+}
+
+candidates <- unique(c(paperUP))
+names(candidates) <- candidates
+
+# Evaluate only those genes in geneInfo
+keep <- is.element(candidates, geneInfo$Symbol)
+candidates <- candidates[keep]
+
+for(i in 1:length(candidates)){
+  candidates[i] <- geneInfo[geneInfo$Symbol == names(candidates)[i], "Gene"]
+}
+
+df = data.frame(Gene = unique(c(names(candidates), names(candidates2))), 
+                EnsemblID = unique(c(candidates, candidates2)), 
+                SourceData = NA, 
+                log2FC.total = NA,
+                padj.total = NA, 
+                maxCPM.total = NA, 
+                log2FC.labeled = NA, 
+                padj.labeled = NA, 
+                maxCPM.labeled = NA)
+
+for(i in 1:nrow(df)){
+     g = df[i, "EnsemblID"]
+     if(g %in% candidates){
+         if(g %in% candidates2){
+             df[i, "SourceData"] = "Aharonov et al;CollecTRI"
+         }else{
+             df[i, "SourceData"] = "Aharonov et al"
+         }
+         }else{
+             df[i, "SourceData"] = "CollecTRI"
+         }
+     }
+
+for(i in 1:nrow(df)){
+     g = df[i, "EnsemblID"]
+     if(g %in% resLFC.total$ENSEMBL){
+         df[i, "log2FC.total"] <- resLFC.total[resLFC.total$ENSEMBL == g, "log2FoldChange"]
+         df[i, "padj.total"] <- resLFC.total[resLFC.total$ENSEMBL == g, "padj"]   
+     }
+     if(g %in% resLFC.labeled$ENSEMBL){
+         df[i, "log2FC.labeled"] <- resLFC.labeled[resLFC.labeled$ENSEMBL == g, "log2FoldChange"]
+         df[i, "padj.labeled"] <- resLFC.labeled[resLFC.labeled$ENSEMBL == g, "padj"]   
+     }
+}
+
+for(i in 1:nrow(df)){
+ g = df[i, "EnsemblID"]
+ if(g %in% rownames(dds.total@assays@data$counts)){
+ df[i, "maxCPM.total"] <- max(plotCounts(dds.total, gene = g, intgroup = "Condition", returnData = TRUE)$count)
+ }
+}
+
+for(i in 1:nrow(df)){
+ g = df[i, "EnsemblID"]
+ if(g %in% rownames(dds.labeled@assays@data$counts)){
+ df[i, "maxCPM.labeled"] <- max(plotCounts(dds.labeled, gene = g, intgroup = "Condition", returnData = TRUE)$count)
+ }
+}
+
+write.table(df, "Differential.Expression/ERBB2_vs_GFP/Information_About_Known_Targets_ERBB2_vs_GFP.tsv", 
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+df2 = df %>% filter(padj.total < 0.1 | padj.labeled < 0.1)
+
+write.table(df2, "Differential.Expression/ERBB2_vs_GFP/Information_About_Known_Targets_ERBB2_vs_GFP_Significant.tsv", 
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+```
+```{r heatmap_selected_genes, echo=FALSE}
+genes <- c("ENSMUSG00000040752", "ENSMUSG00000021313", "ENSMUSG00000022346", "ENSMUSG00000037169", "ENSMUSG00000001131", "ENSMUSG00000024608","ENSMUSG00000049517")
+names(genes) <- c("Myh6", "Ryr2", "Myc", "Mycn", "Timp1", "Rps14", "Rps23")
+
+example.labeled <- scale(t(assay(vsd.labeled)))
+example.labeled <- example.labeled[, genes]
+colnames(example.labeled) <- names(genes)
+pdf("Plots/Differential_Expression/ERBB2_vs_GFP/ERBB2_vs_GFP_Heatmap_ExampleGenes.pdf", height = 3, width = 5)
+Heatmap(t(example.labeled), name = "z-score", show_column_names = FALSE, top_annotation = column_ha)
+dev.off()
+```
